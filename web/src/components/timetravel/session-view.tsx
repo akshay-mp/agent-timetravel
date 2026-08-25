@@ -478,8 +478,19 @@ export function SessionView() {
                     <div key={version.id} className="mt-2 rounded-md border border-amber-400/20 bg-amber-500/[0.05] px-3 py-2 text-xs">
                       <div className="flex items-center gap-2">
                         <p className="min-w-0 flex-1 truncate font-medium text-amber-200">Step {version.cursor + 1} · {version.status}</p>
+                        {version.usage ? (
+                          <span className="shrink-0 text-[10px] text-slate-500">{version.usage.total_tokens.toLocaleString()} tokens</span>
+                        ) : null}
                       </div>
                       <p className="mt-1 line-clamp-2 text-slate-400">{JSON.stringify(version.messages)}</p>
+                      {version.status === "completed" ? (
+                        <div className="mt-2 border-t border-amber-400/10 pt-2">
+                          <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Response</p>
+                          <p className="mt-1 line-clamp-3 whitespace-pre-wrap text-slate-300">{version.result || "(No response captured.)"}</p>
+                        </div>
+                      ) : (
+                        <p className="mt-2 border-t border-amber-400/10 pt-2 text-[10px] italic text-slate-500">Response will appear here when this variant completes.</p>
+                      )}
                     </div>
                   ))}
                   {siblingGroups.length > 0 && (
