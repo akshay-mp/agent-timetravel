@@ -10,7 +10,7 @@ from agent_timetravel.agents import AgentDefinition, TimeTravel, TimeTravelConte
 from agent_timetravel.checkpoint import checkpoint
 from agent_timetravel.tool_intercept import tool
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 timetravel = TimeTravel()
 __all__ = [
     "AgentDefinition",
