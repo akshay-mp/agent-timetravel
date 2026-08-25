@@ -568,7 +568,7 @@ export const useTimeTravelStore = create<TimeTravelState>((set, get) => ({
           pausedStep: {
             ...s.liveSession.pausedStep,
             result: response,
-            reasoning,
+            reasoning: reasoning ?? s.liveSession.pausedStep.reasoning,
             usage: usage ?? null,
             phase: "completed",
             completedAt: Date.now(),
