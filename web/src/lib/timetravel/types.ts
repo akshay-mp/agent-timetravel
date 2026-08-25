@@ -311,6 +311,8 @@ export interface PromptVersion {
   reasoning?: string | null;
   latencyMs?: number;
   completedAt?: number;
+  /** 1-based creation ordinal among variants of the same step; derived at render time. */
+  ordinal?: number;
 }
 
 /** One stepping session's live state, parallel to LiveRun. */

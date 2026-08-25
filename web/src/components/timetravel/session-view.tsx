@@ -270,13 +270,27 @@ export function SessionView() {
   const inspectedStep = selectedEntry ? historyEntryToStep(selectedEntry) : null;
   const displayedStep = inspectedStep ?? liveSession.pausedStep;
   const displayedStepNumber = selectedEntry ? selectedHistoryIndex! + 1 : stepCount;
+  // 1-based creation ordinal of each variant within its step, so cards,
+  // comparison selectors, and matrices all refer to the same variant number.
+  const versionOrdinals = new Map<string, number>(
+    liveSession.promptVersions.map((version) => [
+      version.id,
+      liveSession.promptVersions.filter(
+        (other) => other.cursor === version.cursor && other.createdAt <= version.createdAt,
+      ).length,
+    ]),
+  );
+  const withOrdinal = (version: PromptVersion): PromptVersion => ({
+    ...version,
+    ordinal: versionOrdinals.get(version.id),
+  });
   const comparisonVersions = comparisonIds === null
     ? []
-    : comparisonIds.map((id) => liveSession.promptVersions.find((version) => version.id === id)).filter((version): version is PromptVersion => Boolean(version));
+    : comparisonIds.map((id) => liveSession.promptVersions.find((version) => version.id === id)).filter((version): version is PromptVersion => Boolean(version)).map(withOrdinal);
   const siblingGroups = completedSiblingGroups(liveSession.promptVersions);
   const matrixVersions = matrixCursor === null
     ? []
-    : liveSession.promptVersions.filter((version) => version.cursor === matrixCursor && version.status === "completed");
+    : liveSession.promptVersions.filter((version) => version.cursor === matrixCursor && version.status === "completed").map(withOrdinal);
   const selectedSiblingGroup = siblingGroups.find((group) => group.cursor === comparisonCursor);
   const selectedComparisonIds = comparisonIds ?? [];
   const setComparisonSlot = (slot: 0 | 1, id: string) => {
@@ -477,7 +491,7 @@ export function SessionView() {
                   {liveSession.promptVersions.map((version) => (
                     <div key={version.id} className="mt-2 rounded-md border border-amber-400/20 bg-amber-500/[0.05] px-3 py-2 text-xs">
                       <div className="flex items-center gap-2">
-                        <p className="min-w-0 flex-1 truncate font-medium text-amber-200">Step {version.cursor + 1} · {version.status}</p>
+                        <p className="min-w-0 flex-1 truncate font-medium text-amber-200">Step {version.cursor + 1} · Variant {versionOrdinals.get(version.id) ?? 1} · {version.status}</p>
                         {version.usage ? (
                           <span className="shrink-0 text-[10px] text-slate-500">{version.usage.total_tokens.toLocaleString()} tokens</span>
                         ) : null}
@@ -523,8 +537,8 @@ export function SessionView() {
                             className="h-8 min-w-0 rounded-md border border-slate-600 bg-slate-950/70 px-2 text-xs text-slate-200"
                           >
                             <option value="">Choose left variant</option>
-                            {selectedSiblingGroup.versions.map((version, index) => (
-                              <option key={version.id} value={version.id}>Variant {index + 1} · {version.model || "default model"}</option>
+                            {selectedSiblingGroup.versions.map((version) => (
+                              <option key={version.id} value={version.id}>Variant {versionOrdinals.get(version.id) ?? 1} · {version.model || "default model"}</option>
                             ))}
                           </select>
                           <select
@@ -534,8 +548,8 @@ export function SessionView() {
                             className="h-8 min-w-0 rounded-md border border-slate-600 bg-slate-950/70 px-2 text-xs text-slate-200"
                           >
                             <option value="">Choose right variant</option>
-                            {selectedSiblingGroup.versions.map((version, index) => (
-                              <option key={version.id} value={version.id}>Variant {index + 1} · {version.model || "default model"}</option>
+                            {selectedSiblingGroup.versions.map((version) => (
+                              <option key={version.id} value={version.id}>Variant {versionOrdinals.get(version.id) ?? 1} · {version.model || "default model"}</option>
                             ))}
                           </select>
                         </div>
@@ -1074,7 +1088,7 @@ function PromptVersionComparison({ versions, pricing, onClose }: { versions: Pro
       <div className="grid min-h-0 flex-1 grid-cols-2 gap-4">
         {[baseline, variant].map((version, index) => (
           <div key={version.id} className="flex min-h-0 flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-950/40">
-            <div className="border-b border-slate-700 px-4 py-3 text-xs font-semibold text-slate-200">{index === 0 ? "Original" : "Variant"} · {version.model || "default model"} · {formatTokens(version.usage?.total_tokens ?? 0)} tokens · {formatCost(usageCost(version.usage ?? emptyUsage(), version.pricing ?? pricing))}</div>
+            <div className="border-b border-slate-700 px-4 py-3 text-xs font-semibold text-slate-200">{(version.ordinal ?? index + 1) === 1 ? `Variant ${version.ordinal ?? 1} · original` : `Variant ${version.ordinal ?? index + 1}`} · {version.model || "default model"} · {formatTokens(version.usage?.total_tokens ?? 0)} tokens · {formatCost(usageCost(version.usage ?? emptyUsage(), version.pricing ?? pricing))}</div>
             <div className="border-b border-slate-800 px-4 py-3 text-xs text-slate-400"><p className="font-medium uppercase tracking-wide text-slate-500">Parameter snapshot</p><pre className="mt-2 max-h-24 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-slate-300">{JSON.stringify(version.parameters ?? {}, null, 2)}</pre></div>
             <div className="border-b border-slate-800 px-4 py-3 text-xs"><p className="font-medium uppercase tracking-wide text-slate-500">Prompt messages</p><DiffText left={JSON.stringify(baseline.messages, null, 2)} right={JSON.stringify(variant.messages, null, 2)} side={index === 0 ? "left" : "right"} /></div>
             <div className="min-h-0 flex-1 overflow-auto p-4 font-mono text-xs leading-relaxed"><p className="mb-2 font-sans font-medium uppercase tracking-wide text-slate-500">Response</p><DiffText left={baseline.result ?? ""} right={variant.result ?? ""} side={index === 0 ? "left" : "right"} /></div>
@@ -1098,7 +1112,7 @@ function PromptVersionMatrix({ versions, pricing, onClose }: { versions: PromptV
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden p-5">
       <div className="mb-4 flex items-center gap-3"><div><p className="text-base font-semibold">Prompt comparison matrix</p><p className="text-xs text-slate-400">Step {baseline.cursor + 1} · showing {capped.length} of {versions.length} completed variants · capped at {MAX_COMPARISON_VARIANTS}</p></div><button type="button" onClick={onClose} className="ml-auto text-xs text-cyan-200 hover:text-white">Back to step</button></div>
-      <div className="min-h-0 flex-1 overflow-auto rounded-md border border-slate-700"><table className="w-full min-w-[680px] text-left text-xs"><thead><tr className="border-b border-slate-700 bg-slate-900/70"><th className="px-3 py-2 text-slate-500">Metric</th>{capped.map((version, index) => <th key={version.id} className="px-3 py-2 text-slate-200">{index === 0 ? "Original" : `Variant ${index}`}</th>)}</tr></thead><tbody>{["model", "parameters", "tokens", "cost", "latency", "assertions", "evaluators", "review"].map((metric) => <tr key={metric} className="border-b border-slate-800"><th className="px-3 py-2 font-medium text-slate-400">{metric}</th>{capped.map((version) => <td key={version.id} className="max-w-56 px-3 py-2 align-top font-mono text-slate-300">{metric === "model" ? version.model || "default" : metric === "parameters" ? JSON.stringify(version.parameters ?? {}) : metric === "tokens" ? formatTokens(version.usage?.total_tokens ?? 0) : metric === "cost" ? formatCost(usageCost(version.usage ?? emptyUsage(), version.pricing ?? pricing)) : metric === "latency" ? formatDuration(version.latencyMs ?? completedLatency(version)) : metric === "assertions" ? (version.assertionResult?.passed ? "passed" : version.assertionResult ? "failed" : "not run") : metric === "evaluators" ? Object.entries(version.evaluatorResults ?? {}).map(([name, result]) => `${name}: ${result.passed ? "passed" : "failed"}`).join(" · ") || "not run" : version.reviewVerdict ?? "unreviewed"}</td>)}</tr>)}</tbody></table></div>
+      <div className="min-h-0 flex-1 overflow-auto rounded-md border border-slate-700"><table className="w-full min-w-[680px] text-left text-xs"><thead><tr className="border-b border-slate-700 bg-slate-900/70"><th className="px-3 py-2 text-slate-500">Metric</th>{capped.map((version, index) => <th key={version.id} className="px-3 py-2 text-slate-200">{(version.ordinal ?? index + 1) === 1 ? `Variant ${version.ordinal ?? 1} · original` : `Variant ${version.ordinal ?? index + 1}`}</th>)}</tr></thead><tbody>{["model", "parameters", "tokens", "cost", "latency", "assertions", "evaluators", "review"].map((metric) => <tr key={metric} className="border-b border-slate-800"><th className="px-3 py-2 font-medium text-slate-400">{metric}</th>{capped.map((version) => <td key={version.id} className="max-w-56 px-3 py-2 align-top font-mono text-slate-300">{metric === "model" ? version.model || "default" : metric === "parameters" ? JSON.stringify(version.parameters ?? {}) : metric === "tokens" ? formatTokens(version.usage?.total_tokens ?? 0) : metric === "cost" ? formatCost(usageCost(version.usage ?? emptyUsage(), version.pricing ?? pricing)) : metric === "latency" ? formatDuration(version.latencyMs ?? completedLatency(version)) : metric === "assertions" ? (version.assertionResult?.passed ? "passed" : version.assertionResult ? "failed" : "not run") : metric === "evaluators" ? Object.entries(version.evaluatorResults ?? {}).map(([name, result]) => `${name}: ${result.passed ? "passed" : "failed"}`).join(" · ") || "not run" : version.reviewVerdict ?? "unreviewed"}</td>)}</tr>)}</tbody></table></div>
     </div>
   );
 }
