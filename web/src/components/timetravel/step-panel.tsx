@@ -15,7 +15,7 @@
  *   - destructive      → Stop (inline AlertDialog confirm)
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
@@ -108,6 +108,7 @@ export function StepPanel({ sessionId, step, stepNumber, pricing, canTimeTravel,
   const [evaluatorNames, setEvaluatorNames] = useState<string[]>([]);
   const [selectedEvaluator, setSelectedEvaluator] = useState("");
   const [evaluatorResult, setEvaluatorResult] = useState<string | null>(null);
+  const liveReasoningRef = useRef<HTMLPreElement | null>(null);
 
   useEffect(() => {
     const msgs = step.payload.messages;
@@ -145,6 +146,17 @@ export function StepPanel({ sessionId, step, stepNumber, pricing, canTimeTravel,
       .then((value) => setEvaluatorNames(Array.isArray(value) ? value.filter((name): name is string => typeof name === "string") : []))
       .catch(() => setEvaluatorNames([]));
   }, [isCompleted, isTool]);
+
+  // Keep the live reasoning stream pinned to its newest line, and keep the
+  // completed thinking visible (auto-expanded) so reviewing the reasoning
+  // behind a finished step never needs a hunt for the toggle.
+  useEffect(() => {
+    const el = liveReasoningRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [step.reasoning]);
+  useEffect(() => {
+    if (isCompleted && step.reasoning) setThinkingOpen(true);
+  }, [isCompleted, step.reasoning]);
 
   const decide = async (kind: "approve" | "edit" | "stop" | "step_once" | "mock" | "skip" | "reject" | "run_until_breakpoint", body?: Record<string, unknown>) => {
     setBusy(true);
@@ -292,32 +304,33 @@ export function StepPanel({ sessionId, step, stepNumber, pricing, canTimeTravel,
           reviewVerdict: step.reviewVerdict,
           reviewNote: step.reviewNote,
         };
-        useTimeTravelStore.getState().addPromptVersion(baseline);
         await persistPromptVersion(traceId, baseline);
         await persistPromptVersionResult(baseline.id, baseline);
-        const variant: PromptVersion = {
-          id: `${Date.now()}-${step.cursor}`,
-          cursor: step.cursor,
-          createdAt: Date.now(),
-          baseMessages: step.payload.messages ?? [],
-          messages: revisedMessages,
-          baseModel: step.payload.model ?? "",
-          model: revisedModel,
-          status: "running",
-          result: null,
-          usage: null,
-          parameters: parameterSnapshot(step.payload),
-          branchId: useTimeTravelStore.getState().liveSession?.branchId,
-          parentVersionId: baseline.id,
-          pricing,
-          assertions: step.assertions,
-          evaluatorNames: selectedEvaluator ? [selectedEvaluator] : [],
-          reviewVerdict: step.reviewVerdict,
-          reviewNote: step.reviewNote,
-        };
-        useTimeTravelStore.getState().addPromptVersion(variant);
-        await persistPromptVersion(traceId, variant);
-        await rerunEditedStep(sessionId, runnerRef, step.cursor, revisedMessages, revisedModel);
+        useTimeTravelStore.getState().addPromptVersion(baseline);
+        await rerunEditedStep(sessionId, runnerRef, step.cursor, revisedMessages, revisedModel, async (branch) => {
+          const variant: PromptVersion = {
+            id: `${Date.now()}-${step.cursor}`,
+            cursor: step.cursor,
+            createdAt: Date.now(),
+            baseMessages: step.payload.messages ?? [],
+            messages: revisedMessages,
+            baseModel: step.payload.model ?? "",
+            model: revisedModel,
+            status: "running",
+            result: null,
+            usage: null,
+            parameters: parameterSnapshot(step.payload),
+            branchId: branch.branch_id,
+            parentVersionId: baseline.id,
+            pricing,
+            assertions: step.assertions,
+            evaluatorNames: selectedEvaluator ? [selectedEvaluator] : [],
+            reviewVerdict: step.reviewVerdict,
+            reviewNote: step.reviewNote,
+          };
+          await persistPromptVersion(traceId, variant);
+          useTimeTravelStore.getState().addPromptVersion(variant);
+        });
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -536,17 +549,32 @@ export function StepPanel({ sessionId, step, stepNumber, pricing, canTimeTravel,
 
         {isExecuting && (
           <Card className="border-violet-400/20 bg-violet-500/[0.05] shadow-none">
-            <CardContent className="flex items-center gap-3 py-6 text-sm text-slate-300">
-              <span className="relative flex size-8 items-center justify-center rounded-md bg-violet-400/10">
-                <Brain className="size-4 text-violet-300" />
-                <span className="absolute -right-1 -top-1 size-2 animate-pulse rounded-full bg-violet-300" />
-              </span>
-              <div>
-                <p className="font-medium text-slate-100">{isTool ? "Tool is running" : "Gemma is thinking"}</p>
-                <p className="mt-0.5 text-xs text-slate-400">
-                  {isTool ? "Its result will appear here automatically." : "The final response will appear here automatically."}
-                </p>
+            <CardContent className="py-4">
+              <div className="flex items-center gap-3 text-sm text-slate-300">
+                <span className="relative flex size-8 shrink-0 items-center justify-center rounded-md bg-violet-400/10">
+                  <Brain className="size-4 text-violet-300" />
+                  <span className="absolute -right-1 -top-1 size-2 animate-pulse rounded-full bg-violet-300" />
+                </span>
+                <div>
+                  <p className="font-medium text-slate-100">{isTool ? "Tool is running" : "Gemma is thinking"}</p>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    {!isTool && step.reasoning
+                      ? "Reasoning streams in live — the final response will follow automatically."
+                      : isTool
+                        ? "Its result will appear here automatically."
+                        : "The final response will appear here automatically."}
+                  </p>
+                </div>
               </div>
+              {!isTool && step.reasoning && (
+                <pre
+                  ref={liveReasoningRef}
+                  className="mt-3 max-h-56 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-violet-400/10 bg-black/20 p-3 text-xs italic leading-relaxed text-slate-300"
+                >
+                  {step.reasoning}
+                  <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-violet-300 align-middle" />
+                </pre>
+              )}
             </CardContent>
           </Card>
         )}
@@ -611,10 +639,15 @@ export function StepPanel({ sessionId, step, stepNumber, pricing, canTimeTravel,
           <Card className="shadow-none">
             <CardHeader className="pb-2">
               <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                {isTool ? "Edit tool inputs" : "Edit messages (JSON)"}
+                {isTool ? "Edit tool inputs" : step.restored ? "Edit prompt for a new branch" : "Edit messages (JSON)"}
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
+              {step.restored && !isTool && (
+                <p className="text-xs text-cyan-200">
+                  The original restored result stays preserved. Applying this edit runs the changed prompt on a new divergent branch.
+                </p>
+              )}
               {isTool ? (
                 <>
                   <JsonEditor label="Arguments (JSON array)" value={editedArgs} onChange={setEditedArgs} />
@@ -693,7 +726,7 @@ export function StepPanel({ sessionId, step, stepNumber, pricing, canTimeTravel,
           </Card>
         )}
 
-        {isCompleted && !isTool && evaluatorNames.length > 0 && (
+        {isCompleted && !readOnly && !isTool && evaluatorNames.length > 0 && (
           <Card className="shadow-none">
             <CardHeader className="pb-2"><CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Registered evaluators</CardTitle></CardHeader>
             <CardContent className="space-y-2">
@@ -779,9 +812,9 @@ export function StepPanel({ sessionId, step, stepNumber, pricing, canTimeTravel,
               </Button>
             )}
           </>
-        ) : step.restored ? (
+        ) : step.restored && !editing ? (
           <>
-            <span className="text-xs text-cyan-200">Saved step restored locally. No model or tool call was made.</span>
+            <span className="text-xs text-cyan-200">Saved step restored locally. The original result is preserved; branching runs only new work.</span>
             {canTimeTravel && (
               <Button
                 size="sm"
@@ -791,6 +824,18 @@ export function StepPanel({ sessionId, step, stepNumber, pricing, canTimeTravel,
                 className="ml-auto border-sky-400/40 bg-sky-500/15 text-sky-200 hover:bg-sky-500/25 hover:text-white"
               >
                 <CornerUpLeft className="mr-1.5 size-4" /> Step Back
+              </Button>
+            )}
+            {isCompleted && !isTool && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setEditing(true)}
+                disabled={busy}
+                className="border-violet-400/40 bg-violet-500/20 text-violet-100 hover:bg-violet-500/30"
+                title="Edit the restored prompt and run it on a new branch"
+              >
+                <Pencil className="mr-1.5 size-4" /> Edit Prompt &amp; Branch
               </Button>
             )}
             {canStepForward && (
@@ -958,7 +1003,7 @@ export function StepPanel({ sessionId, step, stepNumber, pricing, canTimeTravel,
         ) : (
           <>
             <Button size="sm" onClick={() => void handleApplyEdit()} disabled={busy}>
-              <PlayCircle className="mr-1 size-4" /> Apply edit &amp; continue
+              <PlayCircle className="mr-1 size-4" /> {step.restored ? "Apply edit & run new branch" : "Apply edit & continue"}
             </Button>
             <Button size="sm" variant="ghost" onClick={() => setEditing(false)} disabled={busy}>
               <CornerUpLeft className="mr-1 size-4" /> Cancel

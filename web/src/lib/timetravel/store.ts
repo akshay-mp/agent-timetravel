@@ -205,6 +205,7 @@ interface TimeTravelState {
   setSessionResult: (result: unknown) => void;
   pauseAtStep: (step: PausedStep) => void;
   markStepDispatching: (cursor: number) => void;
+  appendStepReasoning: (cursor: number, chunk: string) => void;
   /** Attach the model's response text to the current paused step (verify loop). */
   completeStep: (cursor: number, result: string, usage?: StepUsage) => void;
   addCheckpoint: (checkpoint: LiveCheckpoint) => void;
@@ -538,6 +539,19 @@ export const useTimeTravelStore = create<TimeTravelState>((set, get) => ({
           ...s.liveSession,
           status: "running",
           pausedStep: { ...s.liveSession.pausedStep, phase: "running" },
+        },
+      };
+    }),
+
+  appendStepReasoning: (cursor, chunk) =>
+    set((s) => {
+      const step = s.liveSession?.pausedStep;
+      if (!step || step.cursor !== cursor) return s;
+      if (step.phase === "completed") return s;
+      return {
+        liveSession: {
+          ...s.liveSession!,
+          pausedStep: { ...step, reasoning: (step.reasoning ?? "") + chunk },
         },
       };
     }),

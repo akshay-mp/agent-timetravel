@@ -135,9 +135,9 @@ async function resumeSessionOnce(sessionId: string): Promise<string> {
   return session.session_id;
 }
 
-/** Persist a prompt variant; failures are intentionally non-fatal to stepping. */
+/** Persist a prompt variant; HTTP failures must remain visible to the caller. */
 export async function persistPromptVersion(traceId: string, version: PromptVersion): Promise<void> {
-  await fetch(`/api/v1/traces/${encodeURIComponent(traceId)}/prompt-versions`, {
+  const response = await fetch(`/api/v1/traces/${encodeURIComponent(traceId)}/prompt-versions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -157,6 +157,7 @@ export async function persistPromptVersion(traceId: string, version: PromptVersi
       updated_at: new Date(version.createdAt).toISOString(),
     }),
   });
+  if (!response.ok) throw new Error(`prompt version persistence failed: HTTP ${response.status}`);
 }
 
 /** Persist a completed result snapshot, including assertion/review deltas. */
@@ -164,7 +165,7 @@ export async function persistPromptVersionResult(
   versionId: string,
   version: PromptVersion,
 ): Promise<void> {
-  await fetch(`/api/v1/prompt-versions/${encodeURIComponent(versionId)}/result`, {
+  const response = await fetch(`/api/v1/prompt-versions/${encodeURIComponent(versionId)}/result`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -180,6 +181,7 @@ export async function persistPromptVersionResult(
       evaluator_results: version.evaluatorResults ?? {},
     }),
   });
+  if (!response.ok) throw new Error(`prompt version result persistence failed: HTTP ${response.status}`);
 }
 
 /** Persist a local pricing snapshot; callers may retain localStorage offline. */
@@ -419,7 +421,6 @@ export async function restartSessionFrom(
  * POSTs — that's the whole point of stepping.
  */
 let _activeStream: EventSource | null = null;
-let _continueThroughCursor: number | null = null;
 let _pendingPromptEdit: { cursor: number; messages: unknown[]; model: string } | null = null;
 let _runUntilNextLlm = false;
 
@@ -452,20 +453,24 @@ export async function continueUntilNextLlm(sessionId: string): Promise<void> {
   await postDecision(sessionId, { kind: "approve" });
 }
 
-/** Re-run one edited LLM step while serving its earlier trace prefix locally. */
+/** Re-run one edited LLM step from a new branch at its restored cursor. */
 export async function rerunEditedStep(
   sessionId: string,
   runnerRef: string,
   cursor: number,
   messages: unknown[],
   model: string,
+  onBranchCreated?: (response: StartSessionResponse) => Promise<void>,
 ): Promise<string> {
+  const source = useTimeTravelStore.getState().liveSession;
   closeSessionStream();
-  await postDecision(sessionId, { kind: "stop" });
+  if (source && !source.pausedStep?.restored && (source.status === "paused" || source.status === "running")) {
+    await postDecision(sessionId, { kind: "stop" });
+  }
   const res = await fetch(`/api/v1/sessions/${sessionId}/restart-from`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ branch_at: 0, label: `Prompt version at step ${cursor + 1}` }),
+    body: JSON.stringify({ branch_at: cursor, label: `Prompt version at step ${cursor + 1}` }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -473,26 +478,34 @@ export async function rerunEditedStep(
   }
   const data = (await res.json()) as StartSessionResponse;
   _runUntilNextLlm = false;
-  _continueThroughCursor = cursor - 1;
   _pendingPromptEdit = { cursor, messages, model };
+  try {
+    await onBranchCreated?.(data);
+  } catch (error) {
+    _pendingPromptEdit = null;
+    await stopDetachedSession(data.session_id);
+    throw error;
+  }
   useTimeTravelStore.getState().startLiveSession(data.session_id, data.trace_id, data.branch_id, runnerRef, true);
   void streamSessionDecisions(data.session_id);
   return data.session_id;
 }
 
-/** Continue a locally restored timeline after replaying its saved prefix. */
+/** Continue a locally restored timeline from its saved cursor. */
 export async function continueFromSavedState(
   sessionId: string,
   runnerRef: string,
   throughCursor: number,
 ): Promise<string> {
   const { startLiveSession, failSession } = useTimeTravelStore.getState();
+  closeSessionStream();
   const res = await fetch(`/api/v1/sessions/${sessionId}/restart-from`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    // Start at the source branch root so each prior call is served from the
-    // captured trace. The client auto-approves only that saved prefix.
-    body: JSON.stringify({ branch_at: 0, label: "Continue from saved step" }),
+    // Include the restored completed span in the frozen prefix. The
+    // successor starts live after it, so continuation never re-executes the
+    // saved step through the interactive UI.
+    body: JSON.stringify({ branch_at: throughCursor + 1, label: "Continue from saved step" }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -502,7 +515,7 @@ export async function continueFromSavedState(
   }
   const data = (await res.json()) as StartSessionResponse;
   _runUntilNextLlm = false;
-  _continueThroughCursor = throughCursor;
+  _pendingPromptEdit = null;
   startLiveSession(data.session_id, data.trace_id, data.branch_id, runnerRef);
   void streamSessionDecisions(data.session_id);
   return data.session_id;
@@ -512,6 +525,7 @@ export function streamSessionDecisions(sessionId: string): void {
   const {
     pauseAtStep,
     markStepDispatching,
+    appendStepReasoning,
     completeStep,
     completePromptVersion,
     addCheckpoint,
@@ -576,8 +590,6 @@ export function streamSessionDecisions(sessionId: string): void {
           void postDecision(sessionId, { kind: "approve" }).catch(() => undefined);
         } else if (_runUntilNextLlm && evt.kind === "llm") {
           _runUntilNextLlm = false;
-        } else if (session && _continueThroughCursor !== null && evt.cursor <= _continueThroughCursor) {
-          void postDecision(sessionId, { kind: "approve" }).catch(() => undefined);
         } else if (session && evt.kind !== "tool" && evt.kind !== "mcp") {
           void postDecision(sessionId, { kind: "approve" }).catch(() => undefined);
         }
@@ -585,6 +597,9 @@ export function streamSessionDecisions(sessionId: string): void {
       }
       case "dispatching":
         markStepDispatching(evt.cursor);
+        break;
+      case "reasoning_delta":
+        appendStepReasoning(evt.cursor, evt.chunk);
         break;
       case "step_completed": {
         // The model has returned; attach the result to the current paused
@@ -612,9 +627,6 @@ export function streamSessionDecisions(sessionId: string): void {
         // to the next substantive agent step.
         if (_runUntilNextLlm && (evt.kind === "tool" || evt.kind === "mcp")) {
           void postDecision(sessionId, { kind: "approve" }).catch(() => undefined);
-        } else if (_continueThroughCursor !== null && evt.cursor <= _continueThroughCursor) {
-          void postDecision(sessionId, { kind: "approve" }).catch(() => undefined);
-          if (evt.cursor === _continueThroughCursor) _continueThroughCursor = null;
         } else if (shouldAutoContinue(evt.result)) {
           void postDecision(sessionId, { kind: "approve" }).catch(() => undefined);
         }
@@ -650,6 +662,19 @@ export function streamSessionDecisions(sessionId: string): void {
       _activeStream = null;
     }
   };
+}
+
+/** Stop a branch whose setup failed before it became the active UI session. */
+async function stopDetachedSession(sessionId: string): Promise<void> {
+  try {
+    await fetch(`/api/v1/sessions/${sessionId}/decide`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "stop" }),
+    });
+  } catch {
+    // The original persistence error is the actionable failure for the caller.
+  }
 }
 
 async function rerunRegisteredEvaluators(version: PromptVersion): Promise<void> {

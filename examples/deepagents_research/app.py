@@ -24,31 +24,30 @@ Run from this directory::
 
 import os
 from datetime import datetime
+from typing import Any
 
+from deepagents import create_deep_agent
 from dotenv import load_dotenv
-
-load_dotenv()
-
 from langchain.chat_models import init_chat_model
 from langchain_openai import ChatOpenAI
 
-from deepagents import create_deep_agent
+from agent_timetravel import TimeTravel
+
+load_dotenv()
 
 try:
     from research_agent.prompts import (
-        RESEARCHER_INSTRUCTIONS,
         RESEARCH_WORKFLOW_INSTRUCTIONS,
+        RESEARCHER_INSTRUCTIONS,
         SUBAGENT_DELEGATION_INSTRUCTIONS,
     )
     from research_agent.tools import tavily_search, think_tool
-except Exception as exc:  # noqa: BLE001 - make missing keys actionable
+except Exception as exc:
     raise SystemExit(
         f"could not import research_agent ({exc}).\n"
         "Clone the deepagents example, copy .env.example to .env, and set "
         "TAVILY_API_KEY plus either the local-model vars or ANTHROPIC_API_KEY."
     ) from exc
-
-from agent_timetravel import TimeTravel
 
 INSTRUCTIONS = (
     RESEARCH_WORKFLOW_INSTRUCTIONS
@@ -74,7 +73,7 @@ research_sub_agent = {
 }
 
 
-def build_model():
+def build_model() -> Any:
     """Env-configured chat model; local server first, Anthropic fallback."""
     base_url = os.environ.get("OPENAI_BASE_URL")
     model_name = os.environ.get("TIMETRAVEL_MODEL")
@@ -106,7 +105,7 @@ main = TimeTravel(title="Deep Research")
     target=agent_graph,
     description="Type your research question — TimeTravel builds the graph input.",
 )
-async def run(query: str, config: dict | None = None):
+async def run(query: str, config: dict | None = None) -> Any:
     """Run the graph; TimeTravel intercepts every LLM and tool call inside."""
     return await agent_graph.ainvoke(
         {"messages": [{"role": "user", "content": query}]}, config or None

@@ -8,6 +8,11 @@ that during a :func:`timetravel.replay` context:
   recorded ``raw_attributes`` payload (zero outbound traffic).
 * Calls *beyond* the cursor (``BRANCH`` / ``FULL_RERUN`` only) are
   forwarded live and the new span captured under the replay branch.
+* Live-forwarded async calls with an approval channel attached are
+  transparently upgraded to ``stream=True`` so reasoning fragments reach
+  the workbench UI while the model works; the chunks are reassembled into
+  the non-streaming ``ChatCompletion`` the caller expects (disable with
+  ``AGENT_TIMETRAVEL_DISABLE_STREAM_CAPTURE``).
 
 The interceptor never imports ``openai`` at module load — it does so lazily
 on :func:`patch` so projects without ``openai`` installed can still use
@@ -393,12 +398,178 @@ async def _dispatch_async(
         response = _materialise_chat_completion(recorded.payload, _chat_completion_module())
         await _complete_step(session, recorded.payload, signature.model, step, kwargs)
         return response
-    response = await orig_create(self, *args, **kwargs)
+    if _stream_capture_enabled(session):
+        response = await _forward_streaming_async(self, session, orig_create, args, kwargs, step)
+    else:
+        response = await orig_create(self, *args, **kwargs)
     _capture_live_span(
         session, kwargs=kwargs, response=response, signature_model=signature.model
     )
     await _complete_step(session, _response_to_raw(response, kwargs), signature.model, step, kwargs)
     return response
+
+
+# ----------------------------------------------------------------------
+# Live streaming capture (reasoning deltas)
+# ----------------------------------------------------------------------
+#: Env kill-switch: any non-empty value disables transparent streaming
+#: capture so calls are forwarded exactly as the agent issued them.
+_STREAM_CAPTURE_DISABLE_ENV = "AGENT_TIMETRAVEL_DISABLE_STREAM_CAPTURE"
+#: Coalesce reasoning fragments into at most one delta event per interval,
+#: bounding pressure on the channel's capacity-limited event queue.
+_REASONING_DELTA_INTERVAL_S = 0.12
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def _stream_capture_enabled(session: ReplaySession) -> bool:
+    """Transparent streaming is on only while a UI is watching the run."""
+    # pylint: disable=import-outside-toplevel
+    import os
+    # pylint: enable=import-outside-toplevel
+
+    if os.environ.get(_STREAM_CAPTURE_DISABLE_ENV):
+        return False
+    channel = getattr(session, "approval", None)
+    return channel is not None and getattr(channel, "emit_delta", None) is not None
+
+
+def _thinking_so_far(content: str, reasoning: str) -> str:
+    """Best-effort reasoning text from the accumulated stream buffers.
+
+    Handles both provider conventions: separate ``reasoning_content``
+    deltas and Gemma-style inline ``<think>…</think>`` markers — including a
+    still-open ``<think>`` and markers split across chunks (a partial opener
+    never matches, so tag fragments do not leak as reasoning text).
+    """
+    # pylint: disable=import-outside-toplevel
+    import re
+    # pylint: enable=import-outside-toplevel
+
+    match = re.search(rf"<think>([\s\S]*?){_THINK_CLOSE}", content, flags=re.IGNORECASE)
+    if match is not None:
+        inline = match.group(1)
+    else:
+        start = content.lower().find(_THINK_OPEN)
+        inline = content[start + len(_THINK_OPEN):] if start >= 0 else ""
+    return reasoning + inline
+
+
+async def _forward_streaming_async(
+    self: Any,
+    session: ReplaySession,
+    orig_create: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    step: Any,
+) -> Any:
+    """Forward a live call as a token stream, then reassemble the response.
+
+    The request is transparently upgraded to ``stream=True`` (plus
+    ``include_usage``) so reasoning fragments can be published to the
+    approval channel while the model works. Chunks are reassembled into the
+    same non-streaming ``ChatCompletion`` a plain forward would have
+    returned, keeping span capture, usage extraction, and the caller's own
+    code unchanged.
+    """
+    # pylint: disable=import-outside-toplevel
+    import time
+    # pylint: enable=import-outside-toplevel
+
+    stream_options = {**(kwargs.get("stream_options") or {}), "include_usage": True}
+    stream_kwargs = {**kwargs, "stream": True, "stream_options": stream_options}
+
+    emit_delta = getattr(session.approval, "emit_delta", None)
+    cursor = getattr(step, "cursor", 0)
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: dict[int, dict[str, Any]] = {}
+    meta: dict[str, Any] = {"id": None, "created": None, "model": None, "finish_reason": None}
+    usage: dict[str, Any] | None = None
+    emitted = 0
+    last_flush = time.monotonic()
+
+    def flush(force: bool = False) -> None:
+        """Publish newly accumulated reasoning, coalesced by interval."""
+        nonlocal emitted, last_flush
+        if emit_delta is None:
+            return
+        now = time.monotonic()
+        if not force and now - last_flush < _REASONING_DELTA_INTERVAL_S:
+            return
+        thinking = _thinking_so_far("".join(content_parts), "".join(reasoning_parts))
+        if len(thinking) > emitted:
+            emit_delta(cursor, thinking[emitted:])
+            emitted = len(thinking)
+        last_flush = now
+
+    async for chunk in await orig_create(self, *args, **stream_kwargs):
+        meta["id"] = getattr(chunk, "id", None) or meta["id"]
+        meta["created"] = getattr(chunk, "created", None) or meta["created"]
+        meta["model"] = getattr(chunk, "model", None) or meta["model"]
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = _to_jsonable(chunk_usage)
+        choices = getattr(chunk, "choices", None) or []
+        if choices:
+            choice = choices[0]
+            meta["finish_reason"] = (
+                getattr(choice, "finish_reason", None) or meta["finish_reason"]
+            )
+            delta = getattr(choice, "delta", None)
+            if delta is not None:
+                piece = getattr(delta, "content", None)
+                if isinstance(piece, str) and piece:
+                    content_parts.append(piece)
+                reasoning_piece = (
+                    getattr(delta, "reasoning_content", None)
+                    or getattr(delta, "reasoning", None)
+                )
+                if isinstance(reasoning_piece, str) and reasoning_piece:
+                    reasoning_parts.append(reasoning_piece)
+                for call in getattr(delta, "tool_calls", None) or []:
+                    index = getattr(call, "index", 0) or 0
+                    slot = tool_calls.setdefault(
+                        index,
+                        {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    call_id = getattr(call, "id", None)
+                    if call_id:
+                        slot["id"] = call_id
+                    function = getattr(call, "function", None)
+                    if function is not None:
+                        name = getattr(function, "name", None)
+                        if name:
+                            slot["function"]["name"] += name
+                        arguments = getattr(function, "arguments", None)
+                        if isinstance(arguments, str) and arguments:
+                            slot["function"]["arguments"] += arguments
+        flush()
+    flush(force=True)
+
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
+    reasoning = "".join(reasoning_parts)
+    if reasoning.strip():
+        message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    payload: dict[str, Any] = {
+        "id": meta["id"] or "chatcmpl-timetravel-stream",
+        "object": "chat.completion",
+        "created": meta["created"] or 0,
+        "model": meta["model"] or str(kwargs.get("model", "")),
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": meta["finish_reason"] or "stop",
+            }
+        ],
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return _materialise_chat_completion({"gen_ai.response": payload}, _chat_completion_module())
 
 
 async def _complete_step(

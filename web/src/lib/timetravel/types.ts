@@ -230,6 +230,7 @@ export interface BreakpointRule {
 export type StepEvent =
   | { type: "paused"; cursor: number; kind: string; step: StepPayload; pause_reason?: "pause_after_current" | "breakpoint" | null }
   | { type: "dispatching"; cursor: number; decision: string }
+  | { type: "reasoning_delta"; cursor: number; chunk: string }
   | { type: "resumed"; decision: string }
   | { type: "step_completed"; cursor: number; kind: string; result: string; usage?: StepUsage }
   | { type: "checkpoint"; name: string; label: string; cursor: number; keys: string[] }

@@ -788,3 +788,41 @@ class TestDecisionKindsPhase1:
         data = get_res.json()
         assert data["run_until_breakpoint"] is True
         assert data["pause_after_current"] is False
+
+
+# ----------------------------------------------------------------------
+# SSEApprovalChannel.emit_delta — lossy reasoning-fragment publishing
+# ----------------------------------------------------------------------
+async def test_emit_delta_publishes_and_replays_for_inflight_cursor() -> None:
+    """A reasoning delta flows to the SSE queue and the reconnect replay."""
+    ch = SSEApprovalChannel()
+    ch._replay_events = [{"type": "paused", "cursor": 3}]
+    ch.emit_delta(3, "comparing stab")
+    assert (await ch.next_event()) == {
+        "type": "reasoning_delta",
+        "cursor": 3,
+        "chunk": "comparing stab",
+    }
+    assert ch.replay_events_if_idle()[-1] == {
+        "type": "reasoning_delta",
+        "cursor": 3,
+        "chunk": "comparing stab",
+    }
+
+
+async def test_emit_delta_drops_when_queue_full_without_raising() -> None:
+    """A full event queue drops the fragment instead of crashing the run."""
+    ch = SSEApprovalChannel()
+    for i in range(ch._events.maxsize):
+        ch._events.put_nowait({"type": "reasoning_delta", "cursor": 0, "chunk": str(i)})
+    ch.emit_delta(0, "overflow")  # Must not raise QueueFull.
+    assert ch._events.qsize() == ch._events.maxsize
+
+
+async def test_emit_delta_skips_replay_for_stale_cursor() -> None:
+    """Deltas from a cursor other than the in-flight gate are not replayed."""
+    ch = SSEApprovalChannel()
+    ch._replay_events = [{"type": "paused", "cursor": 1}]
+    ch.emit_delta(9, "stale")
+    assert (await ch.next_event())["cursor"] == 9
+    assert all(event.get("cursor") != 9 for event in ch.replay_events_if_idle())

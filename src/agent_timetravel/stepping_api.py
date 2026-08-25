@@ -384,6 +384,24 @@ class SSEApprovalChannel:
         """Non-blocking event publish for runner-driven state (done/errored)."""
         self._events.put_nowait(event)
 
+    def emit_delta(self, cursor: int, chunk: str) -> None:
+        """Lossy publish for high-frequency stream fragments (reasoning deltas).
+
+        Unlike :meth:`emit`, a full event queue drops the fragment instead of
+        raising: the ``step_completed`` event carries the authoritative full
+        text, so a dropped delta only costs a brief UI stutter, never a
+        crashed run. Fragments are appended to the reconnect replay while
+        they belong to the in-flight gate so a mid-generation page refresh
+        restores the reasoning stream too.
+        """
+        event = {"type": "reasoning_delta", "cursor": cursor, "chunk": chunk}
+        try:
+            self._events.put_nowait(event)
+        except asyncio.QueueFull:
+            return
+        if self._replay_events and self._replay_events[0].get("cursor") == cursor:
+            self._replay_events.append(event)
+
     async def complete(
         self, step: Step, result: str, usage: dict[str, int] | None = None
     ) -> Decision:
@@ -1180,6 +1198,8 @@ def mount_stepping(app: FastAPI, registry: TimeTravel | None = None) -> None:
 
         * ``paused``  — agent is blocked at a step; payload includes the Step.
         * ``resumed`` — a decision was applied; the agent continues.
+        * ``reasoning_delta`` — live reasoning fragment while a forwarded LLM
+          call streams (lossy; ``step_completed`` carries the full text).
         * ``done``    — runner completed (normally, via STOP, or cancelled).
         * ``errored`` — runner raised; payload includes the message.
 

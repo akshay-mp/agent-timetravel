@@ -628,3 +628,303 @@ def test_patch_routes_through_replay_when_active(
             )
             # Served from cache — payload content is "hi", not original.
             assert body["choices"][0]["message"]["content"] == "hi"
+
+
+# ----------------------------------------------------------------------
+# Live streaming capture (reasoning deltas)
+# ----------------------------------------------------------------------
+class _FakeAsyncStream:
+    """Minimal async-iterable of ChatCompletionChunk-like objects."""
+
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = list(chunks)
+
+    def __aiter__(self) -> _FakeAsyncStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+def _stream_chunk(
+    content: str | None = None,
+    *,
+    reasoning: str | None = None,
+    usage: dict[str, int] | None = None,
+    finish_reason: str | None = None,
+) -> Any:
+    """Build a chunk shaped like the SDK's ChatCompletionChunk (duck-typed)."""
+    empty = content is None and reasoning is None and finish_reason is None
+    choice: Any | None = None
+    if not empty:
+        delta = types.SimpleNamespace(
+            content=content, reasoning_content=reasoning, reasoning=None, tool_calls=None
+        )
+        choice = types.SimpleNamespace(delta=delta, finish_reason=finish_reason)
+    return types.SimpleNamespace(
+        id="chatcmpl-stream",
+        created=123,
+        model="unsloth/gemma-4-12b-it-GGUF",
+        usage=usage,
+        choices=[choice] if choice is not None else [],
+    )
+
+
+def _tool_call_chunk(
+    index: int,
+    call_id: str | None = None,
+    name: str | None = None,
+    arguments: str | None = None,
+) -> Any:
+    """Build a chunk carrying a tool-call delta fragment."""
+    call = types.SimpleNamespace(
+        index=index,
+        id=call_id,
+        function=types.SimpleNamespace(name=name, arguments=arguments),
+    )
+    delta = types.SimpleNamespace(
+        content=None, reasoning_content=None, reasoning=None, tool_calls=[call]
+    )
+    choice = types.SimpleNamespace(delta=delta, finish_reason=None)
+    return types.SimpleNamespace(
+        id="chatcmpl-stream",
+        created=123,
+        model="unsloth/gemma-4-12b-it-GGUF",
+        usage=None,
+        choices=[choice],
+    )
+
+
+class _StreamingApproval:
+    """Approval channel double that records reasoning deltas and completions."""
+
+    def __init__(self) -> None:
+        self.deltas: list[tuple[int, str]] = []
+        self.completed: list[tuple[str, dict[str, int] | None]] = []
+        self.step_cursor: int | None = None
+
+    async def submit(self, step: Any) -> Decision:
+        self.step_cursor = step.cursor
+        return Decision(kind=DecisionKind.APPROVE)
+
+    async def complete(
+        self, step: Any, result: str, usage: dict[str, int] | None = None
+    ) -> Decision:
+        self.completed.append((result, usage))
+        return Decision(kind=DecisionKind.APPROVE)
+
+    def emit_delta(self, cursor: int, chunk: str) -> None:
+        self.deltas.append((cursor, chunk))
+
+
+def _dispatch_live(
+    session: ReplaySession,
+    orig_create: Any,
+    messages: list[dict[str, str]] | None = None,
+) -> Any:
+    """Run one live-forwarded async dispatch with distinct-from-cache messages."""
+    kwargs: dict[str, Any] = {
+        "model": "unsloth/gemma-4-12b-it-GGUF",
+        "messages": messages or [{"role": "user", "content": "compare RLHF and DPO"}],
+    }
+    return asyncio.run(_dispatch_async(object(), session, orig_create, (), kwargs))
+
+
+def _body(response: Any) -> dict[str, Any]:
+    return response.model_dump() if hasattr(response, "model_dump") else response
+
+
+def test_dispatch_async_streams_inline_thinking_deltas(
+    seeded_store: tuple[TraceStore, list[Span], list[dict[str, str]]],
+    trace_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live forwards stream <think> fragments and reassemble the same response."""
+    import agent_timetravel.openai_intercept as intercept_module
+
+    store, _spans, _messages = seeded_store
+    monkeypatch.setattr(intercept_module, "_REASONING_DELTA_INTERVAL_S", 0.0)
+    approval = _StreamingApproval()
+    session = ReplaySession.for_root(
+        store, trace_id, mode=ReplayMode.INTERACTIVE, approval=approval
+    )
+    seen: list[dict[str, Any]] = []
+    chunks = [
+        _stream_chunk("<th"),  # Opener split across chunk boundaries.
+        _stream_chunk("ink>should compare stability first"),
+        _stream_chunk("</think>"),
+        _stream_chunk("Final answer: DPO is cheaper.", finish_reason="stop"),
+        _stream_chunk(usage={"prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14}),
+    ]
+
+    async def orig_create(_self: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return _FakeAsyncStream(chunks)
+
+    response = _dispatch_live(session, orig_create)
+
+    # The request was transparently upgraded to a usage-reporting stream.
+    assert seen[0]["stream"] is True
+    assert seen[0]["stream_options"]["include_usage"] is True
+    # Reasoning fragments were published while the stream was consumed…
+    streamed = "".join(chunk for _cursor, chunk in approval.deltas)
+    assert streamed == "should compare stability first"
+    assert approval.deltas
+    assert all(cursor == approval.step_cursor for cursor, _chunk in approval.deltas)
+    # …and the caller still receives the reassembled non-streaming response.
+    body = _body(response)
+    assert body["choices"][0]["message"]["content"] == (
+        "<think>should compare stability first</think>Final answer: DPO is cheaper."
+    )
+    assert body["usage"]["total_tokens"] == 14
+    # The verify loop saw the full <think> block and real provider usage.
+    result, usage = approval.completed[0]
+    assert result.startswith("<think>should compare stability first</think>")
+    assert usage is not None
+    assert usage["estimated"] is False
+    assert usage["total_tokens"] == 14
+
+
+def test_dispatch_async_streams_separate_reasoning_field(
+    seeded_store: tuple[TraceStore, list[Span], list[dict[str, str]]],
+    trace_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Providers that emit reasoning_content deltas stream without <think> tags."""
+    import agent_timetravel.openai_intercept as intercept_module
+
+    store, _spans, _messages = seeded_store
+    monkeypatch.setattr(intercept_module, "_REASONING_DELTA_INTERVAL_S", 0.0)
+    approval = _StreamingApproval()
+    session = ReplaySession.for_root(
+        store, trace_id, mode=ReplayMode.INTERACTIVE, approval=approval
+    )
+    chunks = [
+        _stream_chunk(reasoning="deep thought "),
+        _stream_chunk(reasoning="about DPO"),
+        _stream_chunk("DPO skips the reward model.", finish_reason="stop"),
+        _stream_chunk(usage={"prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14}),
+    ]
+
+    async def orig_create(_self: Any, *args: Any, **kwargs: Any) -> Any:
+        return _FakeAsyncStream(chunks)
+
+    response = _dispatch_live(session, orig_create)
+
+    streamed = "".join(chunk for _cursor, chunk in approval.deltas)
+    assert streamed == "deep thought about DPO"
+    body = _body(response)
+    assert body["choices"][0]["message"]["content"] == "DPO skips the reward model."
+    assert body["choices"][0]["message"]["reasoning_content"] == "deep thought about DPO"
+    result, _usage = approval.completed[0]
+    assert result == "<think>deep thought about DPO</think>\nDPO skips the reward model."
+
+
+def test_dispatch_async_no_thinking_model_emits_no_deltas(
+    seeded_store: tuple[TraceStore, list[Span], list[dict[str, str]]],
+    trace_id: str,
+) -> None:
+    """A plain model streams no reasoning; the response round-trips untouched."""
+    store, _spans, _messages = seeded_store
+    approval = _StreamingApproval()
+    session = ReplaySession.for_root(
+        store, trace_id, mode=ReplayMode.INTERACTIVE, approval=approval
+    )
+    chunks = [
+        _stream_chunk("plain "),
+        _stream_chunk("answer", finish_reason="stop"),
+    ]
+
+    async def orig_create(_self: Any, *args: Any, **kwargs: Any) -> Any:
+        return _FakeAsyncStream(chunks)
+
+    response = _dispatch_live(session, orig_create)
+
+    assert approval.deltas == []
+    assert _body(response)["choices"][0]["message"]["content"] == "plain answer"
+
+
+def test_dispatch_async_stream_capture_kill_switch(
+    seeded_store: tuple[TraceStore, list[Span], list[dict[str, str]]],
+    trace_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AGENT_TIMETRAVEL_DISABLE_STREAM_CAPTURE forwards the call verbatim."""
+    store, _spans, _messages = seeded_store
+    monkeypatch.setenv("AGENT_TIMETRAVEL_DISABLE_STREAM_CAPTURE", "1")
+    approval = _StreamingApproval()
+    session = ReplaySession.for_root(
+        store, trace_id, mode=ReplayMode.INTERACTIVE, approval=approval
+    )
+    seen: list[dict[str, Any]] = []
+
+    async def orig_create(_self: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return _fake_chat_completion("live", "LIVE")
+
+    response = _dispatch_live(session, orig_create)
+
+    assert "stream" not in seen[0]
+    assert _body(response)["choices"][0]["message"]["content"] == "LIVE"
+    assert approval.deltas == []
+
+
+def test_dispatch_async_plain_channel_forwards_without_streaming(
+    seeded_store: tuple[TraceStore, list[Span], list[dict[str, str]]],
+    trace_id: str,
+) -> None:
+    """Channels without emit_delta (e.g. in-process test doubles) stay as-is."""
+
+    class _PlainApproval(_StreamingApproval):
+        emit_delta = None  # type: ignore[assignment]
+
+    store, _spans, _messages = seeded_store
+    approval = _PlainApproval()
+    session = ReplaySession.for_root(
+        store, trace_id, mode=ReplayMode.INTERACTIVE, approval=approval
+    )
+    seen: list[dict[str, Any]] = []
+
+    async def orig_create(_self: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return _fake_chat_completion("live", "LIVE")
+
+    response = _dispatch_live(session, orig_create)
+
+    assert "stream" not in seen[0]
+    assert _body(response)["choices"][0]["message"]["content"] == "LIVE"
+
+
+def test_dispatch_async_reassembles_tool_call_deltas(
+    seeded_store: tuple[TraceStore, list[Span], list[dict[str, str]]],
+    trace_id: str,
+) -> None:
+    """Tool-call fragments streamed across chunks rebuild the full call."""
+    store, _spans, _messages = seeded_store
+    approval = _StreamingApproval()
+    session = ReplaySession.for_root(
+        store, trace_id, mode=ReplayMode.INTERACTIVE, approval=approval
+    )
+    chunks = [
+        _tool_call_chunk(0, call_id="call_1", name="search"),
+        _tool_call_chunk(0, arguments='{"q": '),
+        _tool_call_chunk(0, arguments='"rlhf"}'),
+        _stream_chunk(finish_reason="tool_calls"),
+    ]
+
+    async def orig_create(_self: Any, *args: Any, **kwargs: Any) -> Any:
+        return _FakeAsyncStream(chunks)
+
+    response = _dispatch_live(session, orig_create)
+
+    body = _body(response)
+    assert body["choices"][0]["message"]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search", "arguments": '{"q": "rlhf"}'},
+        }
+    ]
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
