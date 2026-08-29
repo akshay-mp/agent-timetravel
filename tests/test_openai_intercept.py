@@ -928,3 +928,44 @@ def test_dispatch_async_reassembles_tool_call_deltas(
         }
     ]
     assert body["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_capture_only_observes_without_gating_or_spans(
+    seeded_store: tuple[TraceStore, list[Span], list[dict[str, str]]],
+    trace_id: str,
+) -> None:
+    """Wire-level observe mode: forward verbatim, stash raw, no gate/span."""
+    from agent_timetravel.openai_intercept import capture_only, last_wire_raw
+
+    store, _spans, messages = seeded_store
+    approval = _StreamingApproval()
+    session = ReplaySession.for_root(
+        store, trace_id, mode=ReplayMode.INTERACTIVE, approval=approval
+    )
+    seen: list[dict[str, Any]] = []
+
+    async def orig_create(_self: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return _fake_chat_completion("live", "LIVE")
+
+    kwargs: dict[str, Any] = {"model": "qwen3:32b", "messages": messages}
+    spans_before = len(store.get_spans(trace_id))
+
+    def scenario() -> Any:
+        with capture_only():
+            response = asyncio.run(
+                _dispatch_async(object(), session, orig_create, (), kwargs)
+            )
+            wire = last_wire_raw()
+        return response, wire
+
+    response, wire = asyncio.run(asyncio.to_thread(scenario))
+
+    assert seen == [{"model": "qwen3:32b", "messages": messages}]  # Verbatim.
+    assert approval.step_cursor is None  # No gate surfaced.
+    assert approval.completed == []
+    assert len(store.get_spans(trace_id)) == spans_before  # No span added.
+    body = _body(response)
+    assert body["choices"][0]["message"]["content"] == "LIVE"
+    assert wire is not None
+    assert wire["gen_ai.response"]["choices"][0]["message"]["content"] == "LIVE"

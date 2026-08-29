@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from agent_timetravel.replay import CallSignature, ReplaySession
 
-__all__ = ["InterceptError", "extract_signature", "patch"]
+__all__ = ["InterceptError", "capture_only", "extract_signature", "last_wire_raw", "patch"]
 
 
 class InterceptError(RuntimeError):
@@ -47,6 +47,64 @@ _PATCHED_SYNC_CLASS: Any = None
 _PATCHED_ASYNC_CLASS: Any = None
 _ORIGINAL_SYNC_CREATE: Any = None
 _ORIGINAL_ASYNC_CREATE: Any = None
+
+#: Observe-only mode, owned by the LangGraph interceptor. While set, a
+#: patched SDK ``create`` neither gates nor records — it forwards verbatim
+#: and stashes the raw wire response for the framework-level dispatcher to
+#: merge (langchain drops ``reasoning_content`` before the model-level
+#: interceptor can see it). See :func:`capture_only` / :func:`last_wire_raw`.
+_CAPTURE_ONLY: Any = None
+_WIRE_RAW: Any = None
+
+
+def _capture_only_var() -> Any:
+    global _CAPTURE_ONLY
+    if _CAPTURE_ONLY is None:
+        # pylint: disable=import-outside-toplevel
+        from contextvars import ContextVar
+        # pylint: enable=import-outside-toplevel
+
+        _CAPTURE_ONLY = ContextVar("timetravel_capture_only", default=False)
+    return _CAPTURE_ONLY
+
+
+def _wire_raw_var() -> Any:
+    global _WIRE_RAW
+    if _WIRE_RAW is None:
+        # pylint: disable=import-outside-toplevel
+        from contextvars import ContextVar
+        # pylint: enable=import-outside-toplevel
+
+        _WIRE_RAW = ContextVar("timetravel_wire_raw", default=None)
+    return _WIRE_RAW
+
+
+@contextmanager
+def capture_only() -> Iterator[dict[str, Any]]:
+    """Forward SDK calls verbatim while stashing the raw wire response.
+
+    Yields a shared holder dict so the stashed payload stays visible across
+    task/context boundaries (ContextVar ``set`` inside a task would not
+    propagate back to the framework dispatcher that opened this block).
+    """
+    holder: dict[str, Any] = {"raw": None}
+    token = _capture_only_var().set(holder)
+    try:
+        yield holder
+    finally:
+        _capture_only_var().reset(token)
+
+
+def _wire_raw_holder() -> dict[str, Any] | None:
+    holder = _capture_only_var().get()
+    return holder if isinstance(holder, dict) else None
+
+
+def last_wire_raw() -> dict[str, Any] | None:
+    """Raw ``gen_ai.*`` payload of the last capture-only SDK call, if any."""
+    holder = _wire_raw_holder()
+    raw = holder.get("raw") if holder else None
+    return raw if isinstance(raw, dict) else None
 
 
 # ----------------------------------------------------------------------
@@ -224,6 +282,17 @@ def _capture_live_span(
 
 def _response_to_raw(response: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Flatten a live SDK ChatCompletion into the TimeTravel raw_attributes shape."""
+    # langchain-openai calls ``client.with_raw_response.create(...)`` and gets
+    # a ``LegacyAPIResponse`` wrapper — unwrap to the inner ChatCompletion or
+    # the payload (and the provider reasoning it carries) is lost.
+    # pylint: disable=import-outside-toplevel
+    parse = getattr(response, "parse", None)
+    # pylint: enable=import-outside-toplevel
+    if parse is not None and not isinstance(response, dict):
+        try:
+            response = parse()
+        except Exception:  # pragma: no cover - parse failure keeps the wrapper
+            pass
     payload = _to_jsonable(response)
     raw: dict[str, Any] = {}
     raw["gen_ai.request.model"] = str(kwargs.get("model", ""))
@@ -353,6 +422,12 @@ def _dispatch_sync(
     from agent_timetravel.replay import ReplayError
     # pylint: enable=import-outside-toplevel
 
+    if _capture_only_var().get():
+        response = orig_create(self, *args, **kwargs)
+        holder = _wire_raw_holder()
+        if holder is not None:
+            holder["raw"] = _response_to_raw(response, kwargs)
+        return response
     if kwargs.get("stream") and session.mode is ReplayMode.FROZEN:
         raise ReplayError(
             "frozen streaming replay not yet supported (Phase 5); "
@@ -386,6 +461,14 @@ async def _dispatch_async(
     from agent_timetravel.replay import ReplayError
     # pylint: enable=import-outside-toplevel
 
+    if _capture_only_var().get():
+        # Framework-owned dispatch (LangGraph): observe and hand the raw
+        # wire payload to the dispatcher — no gate, no replay, no spans.
+        response = await orig_create(self, *args, **kwargs)
+        holder = _wire_raw_holder()
+        if holder is not None:
+            holder["raw"] = _response_to_raw(response, kwargs)
+        return response
     if kwargs.get("stream") and session.mode is ReplayMode.FROZEN:
         raise ReplayError(
             "frozen streaming replay not yet supported (Phase 5); "

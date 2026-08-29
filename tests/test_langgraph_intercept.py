@@ -781,3 +781,222 @@ def test_named_non_tool_messages_are_stripped_for_strict_servers(
     sent = tracker[0]
     assert sent[0]["name"] is None  # human message stripped
     assert sent[1]["name"] == "search"  # tool message keeps its name
+
+
+# ----------------------------------------------------------------------
+# Provider reasoning (reasoning_content) display + persistence
+# ----------------------------------------------------------------------
+def test_llm_result_text_wraps_reasoning_content() -> None:
+    """Separate reasoning_content lands in the <think> display convention."""
+    from agent_timetravel.langgraph_intercept import _llm_result_text
+
+    message = AIMessage(
+        content="DPO skips the reward model.",
+        additional_kwargs={"reasoning_content": "compare parameter counts"},
+    )
+    assert _llm_result_text(message) == (
+        "<think>compare parameter counts</think>\nDPO skips the reward model."
+    )
+
+
+def test_llm_result_text_reasoning_only_message() -> None:
+    """A message whose text lives entirely in reasoning_content still shows."""
+    from agent_timetravel.langgraph_intercept import _llm_result_text
+
+    message = AIMessage(
+        content="",
+        additional_kwargs={"reasoning_content": "pure reasoning"},
+    )
+    assert _llm_result_text(message) == "<think>pure reasoning</think>"
+
+
+def test_llm_result_text_keeps_inline_think_block() -> None:
+    """Inline <think> content is left untouched — no double wrapping."""
+    from agent_timetravel.langgraph_intercept import _llm_result_text
+
+    message = AIMessage(
+        content="<think>inline</think>answer",
+        additional_kwargs={"reasoning_content": "ignored"},
+    )
+    assert _llm_result_text(message) == "<think>inline</think>answer"
+
+
+def test_async_invoke_persists_reasoning_in_span(
+    store: TraceStore, trace_id: str
+) -> None:
+    """A live capture keeps reasoning_content in the recorded wire message."""
+    from langchain_core.messages import HumanMessage
+
+    from agent_timetravel.enums import ReplayMode
+    from agent_timetravel.langgraph_intercept import patch
+    from agent_timetravel.replay import replay as replay_ctx
+
+    _seed_trace(store, trace_id, [])
+    model, tracker = _fake_model()
+    # Inject reasoning through additional_kwargs on the async path the
+    # scenario actually exercises (ainvoke -> _agenerate).
+    original_agenerate = type(model)._agenerate  # type: ignore[attr-defined]
+
+    async def _agenerate_with_reasoning(self: Any, messages: Any, **kwargs: Any) -> Any:
+        result = await original_agenerate(self, messages, **kwargs)
+        result.generations[0].message.additional_kwargs["reasoning_content"] = (
+            "plan before answering"
+        )
+        return result
+
+    type(model)._agenerate = _agenerate_with_reasoning  # type: ignore[method-assign]
+    channel = AsyncioChannel()
+
+    async def scenario() -> str:
+        approver = asyncio.create_task(
+            _approve_all(channel, Decision(kind=DecisionKind.APPROVE))
+        )
+        with patch(), replay_ctx(
+            store, trace_id, mode=ReplayMode.INTERACTIVE, approval=channel
+        ) as session:
+            await model.ainvoke([HumanMessage(content="hello")])
+        approver.cancel()
+        return str(session.branch_id)
+
+    branch_id = asyncio.run(scenario())
+    spans = store.get_spans(trace_id, branch_id=branch_id)
+    stored = spans[0].raw_attributes["gen_ai.response"]["choices"][0]["message"]
+    assert stored["reasoning_content"] == "plan before answering"
+
+
+def test_materialise_message_restores_reasoning(
+    store: TraceStore, trace_id: str
+) -> None:
+    """Frozen replay rebuilds reasoning into additional_kwargs for display."""
+    from langchain_core.messages import HumanMessage
+
+    from agent_timetravel.enums import ReplayMode
+    from agent_timetravel.enums import SpanStatus
+    from agent_timetravel.langgraph_intercept import (
+        _materialise_message,
+        patch,
+    )
+    from agent_timetravel.models import Span, hash_payload
+    from agent_timetravel.replay import RecordedResponse
+
+    span = Span(
+        trace_id=trace_id,
+        span_id="b" * 16,
+        parent_span_id=None,
+        name="langchain.fake",
+        kind=SpanKind.LLM,
+        status=SpanStatus.OK,
+        model_name="fake",
+        prompt_tokens=5,
+        completion_tokens=3,
+        total_tokens=8,
+        messages_hash=hash_payload(
+            [HumanMessage(content="hello").model_dump()]
+        ),
+        raw_attributes={
+            "gen_ai.response": {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "final answer",
+                            "reasoning_content": "recorded reasoning",
+                        }
+                    }
+                ]
+            }
+        },
+    )
+    message = _materialise_message(
+        RecordedResponse(
+            payload=span.raw_attributes,
+            span_id=span.span_id,
+            timetravel_id=span.trace_id,
+            model=span.model_name,
+        )
+    )
+    assert message.additional_kwargs["reasoning_content"] == "recorded reasoning"
+    from agent_timetravel.langgraph_intercept import _llm_result_text
+
+    assert _llm_result_text(message) == (
+        "<think>recorded reasoning</think>\nfinal answer"
+    )
+
+
+def test_async_invoke_merges_wire_reasoning_into_span_and_result(
+    store: TraceStore, trace_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wire-captured reasoning reaches both the span payload and the UI text."""
+    from langchain_core.messages import HumanMessage
+
+    from agent_timetravel.enums import ReplayMode
+    from agent_timetravel.langgraph_intercept import patch
+    from agent_timetravel.openai_intercept import _wire_raw_holder, capture_only
+    from agent_timetravel.replay import replay as replay_ctx
+
+    _seed_trace(store, trace_id, [])
+    model, _tracker = _fake_model()
+    channel = AsyncioChannel()
+
+    async def ainvoke_with_wire(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        # Simulate the OpenAI SDK layer observing the call under capture-only.
+        holder = _wire_raw_holder()
+        if holder is not None:
+            holder["raw"] = {
+                "gen_ai.request.model": "wire-model",
+                "gen_ai.response": {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": "wire-level reasoning",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "search",
+                                            "arguments": '{"q": "tt"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 4,
+                        "total_tokens": 11,
+                    },
+                },
+            }
+        from langchain_core.messages import AIMessage as _AIM
+
+        return _AIM(content="", tool_calls=[
+            {"name": "search", "args": {"q": "tt"}, "id": "call_1", "type": "tool_call"}
+        ])
+
+    monkeypatch.setattr(
+        "langchain_core.language_models.chat_models.BaseChatModel.ainvoke",
+        ainvoke_with_wire,
+    )
+
+    async def scenario() -> str:
+        approver = asyncio.create_task(
+            _approve_all(channel, Decision(kind=DecisionKind.APPROVE))
+        )
+        with patch(), replay_ctx(
+            store, trace_id, mode=ReplayMode.INTERACTIVE, approval=channel
+        ) as session:
+            await model.ainvoke([HumanMessage(content="hello")])
+        approver.cancel()
+        return str(session.branch_id)
+
+    branch_id = asyncio.run(scenario())
+    spans = store.get_spans(trace_id, branch_id=branch_id)
+    stored = spans[0].raw_attributes["gen_ai.response"]["choices"][0]["message"]
+    # The wire payload (reasoning + OpenAI-form tool calls + usage) was stored.
+    assert stored["reasoning_content"] == "wire-level reasoning"
+    assert stored["tool_calls"][0]["function"]["name"] == "search"
+    assert spans[0].total_tokens == 11

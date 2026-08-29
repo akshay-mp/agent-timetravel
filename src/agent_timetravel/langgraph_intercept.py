@@ -178,7 +178,15 @@ def patch() -> Iterator[None]:
             _PATCH_DEPTH = 1
 
     try:
-        yield
+        # The wire-level SDK hook runs in observe-only mode around framework
+        # model calls (see capture_only) so provider reasoning survives the
+        # langchain-openai conversion, which drops ``reasoning_content``.
+        # pylint: disable=import-outside-toplevel
+        from agent_timetravel.openai_intercept import patch as patch_openai
+        # pylint: enable=import-outside-toplevel
+
+        with patch_openai():
+            yield
     finally:
         with _PATCH_LOCK:
             _PATCH_DEPTH -= 1
@@ -293,6 +301,37 @@ def _message_content(message: AIMessage) -> str:
         return ""
 
 
+def _reasoning_of(message: AIMessage) -> str:
+    """Provider reasoning langchain keeps out of ``content``.
+
+    OpenAI-compatible servers (llama.cpp among them) deliver thinking as a
+    separate ``reasoning_content`` field; langchain aggregates it into
+    ``additional_kwargs`` rather than the text content.
+    """
+    # pylint: disable=import-outside-toplevel
+    additional = getattr(message, "additional_kwargs", None) or {}
+    # pylint: enable=import-outside-toplevel
+    for source in (getattr(message, "reasoning_content", None), additional.get("reasoning_content"), additional.get("reasoning")):
+        if isinstance(source, str) and source.strip():
+            return source.strip()
+    return ""
+
+
+def _with_thinking(content: str, message: AIMessage) -> str:
+    """Normalise provider reasoning into the ``<think>`` display convention.
+
+    Mirrors the OpenAI interceptor's response-text shape so the workbench
+    reasoning panel lights up regardless of which interceptor captured the
+    call.
+    """
+    reasoning = _reasoning_of(message)
+    if not reasoning or "<think>" in content.lower():
+        return content
+    if content.strip():
+        return f"<think>{reasoning}</think>\n{content}"
+    return f"<think>{reasoning}</think>"
+
+
 def _usage_metadata(message: AIMessage) -> dict[str, int]:
     meta = getattr(message, "usage_metadata", None)
     if not isinstance(meta, dict):
@@ -360,10 +399,19 @@ def _materialise_message(recorded: RecordedResponse) -> AIMessage:
             "output_tokens": usage.get("completion_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0),
         }
+    additional_kwargs: dict[str, Any] = {}
+    reasoning = (
+        recorded_message.get("reasoning_content")
+        if isinstance(recorded_message, dict)
+        else None
+    )
+    if isinstance(reasoning, str) and reasoning.strip():
+        additional_kwargs["reasoning_content"] = reasoning
     return AIMessage(
         content=content,
         tool_calls=tool_calls,
         usage_metadata=usage_metadata,
+        additional_kwargs=additional_kwargs,
     )
 
 
@@ -410,8 +458,14 @@ def _capture_live_llm_span(
     model: Any,
     result: AIMessage,
     signature: Any,
+    wire_raw: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Persist an LLM span for a live-forwarded call; return its raw payload."""
+    """Persist an LLM span for a live-forwarded call; return its raw payload.
+
+    ``wire_raw`` is the observe-only SDK capture (:func:`capture_only`). When
+    present it is the authoritative payload — it carries the provider's own
+    reasoning and usage that the langchain message conversion dropped.
+    """
     # pylint: disable=import-outside-toplevel
     from secrets import token_hex
 
@@ -419,38 +473,56 @@ def _capture_live_llm_span(
     from agent_timetravel.models import Span
     # pylint: enable=import-outside-toplevel
 
-    content = _message_content(result)
-    usage = _usage_metadata(result)
-    # Store tool calls in langchain-native form so frozen replay can rebuild
-    # the exact assistant decision (name, args, id) — see _materialise_message.
-    stored_calls = [
-        {
-            "name": call.get("name"),
-            "args": call.get("args") or {},
-            "id": call.get("id") or "",
-            "type": "tool_call",
+    if isinstance(wire_raw, dict) and wire_raw.get("gen_ai.response"):
+        raw = dict(wire_raw)
+        raw.setdefault("gen_ai.request.model", _model_name(model))
+        # Flatten nested usage into the span-column keys when the capture
+        # didn't already do it (the OpenAI-side capture normally does).
+        response = raw["gen_ai.response"]
+        usage = response.get("usage") if isinstance(response, dict) else None
+        if isinstance(usage, dict) and "gen_ai.usage.total_tokens" not in raw:
+            for side in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                value = usage.get(side)
+                if isinstance(value, int):
+                    raw[f"gen_ai.usage.{side}"] = value
+    else:
+        content = _message_content(result)
+        usage = _usage_metadata(result)
+        reasoning = _reasoning_of(result)
+        # Store tool calls in langchain-native form so frozen replay can rebuild
+        # the exact assistant decision (name, args, id) — see _materialise_message.
+        stored_calls = [
+            {
+                "name": call.get("name"),
+                "args": call.get("args") or {},
+                "id": call.get("id") or "",
+                "type": "tool_call",
+            }
+            for call in _tool_calls_of(result)
+        ]
+        assistant: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning:
+            # OpenAI wire form: keep reasoning in the recorded message so a
+            # frozen replay (and the timeline) keeps the thinking too.
+            assistant["reasoning_content"] = reasoning
+        if stored_calls:
+            assistant["tool_calls"] = stored_calls
+        raw = {
+            "gen_ai.request.model": _model_name(model),
+            "gen_ai.response": {"choices": [{"message": assistant}]},
         }
-        for call in _tool_calls_of(result)
-    ]
-    assistant: dict[str, Any] = {"role": "assistant", "content": content}
-    if stored_calls:
-        assistant["tool_calls"] = stored_calls
-    raw: dict[str, Any] = {
-        "gen_ai.request.model": _model_name(model),
-        "gen_ai.response": {"choices": [{"message": assistant}]},
-    }
-    if usage:
-        raw["gen_ai.response"]["usage"] = {
-            "prompt_tokens": usage.get("input_tokens", 0),
-            "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0),
-        }
-        for side, key in (
-            ("prompt_tokens", "input_tokens"),
-            ("completion_tokens", "output_tokens"),
-            ("total_tokens", "total_tokens"),
-        ):
-            raw[f"gen_ai.usage.{side}"] = usage[key]
+        if usage:
+            raw["gen_ai.response"]["usage"] = {
+                "prompt_tokens": usage.get("input_tokens", 0),
+                "completion_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+            for side, key in (
+                ("prompt_tokens", "input_tokens"),
+                ("completion_tokens", "output_tokens"),
+                ("total_tokens", "total_tokens"),
+            ):
+                raw[f"gen_ai.usage.{side}"] = usage[key]
     span = Span(
         trace_id=session.trace_id,
         span_id=token_hex(8),
@@ -497,18 +569,30 @@ def _llm_usage(
         else payload
     )
     return _extract_usage(
-        effective, {"messages": call_kwargs["messages"]}, _message_content(message)
+        effective,
+        {"messages": call_kwargs["messages"]},
+        _with_thinking(_message_content(message), message),
     )
 
 
-def _llm_result_text(message: AIMessage) -> str:
+def _llm_result_text(message: AIMessage, extra_reasoning: str | None = None) -> str:
     """What the debugger shows as the step result.
 
     Text content when present; otherwise a one-line summary of the assistant's
     tool-call decisions, so a planning turn that emits only tool calls still
-    shows something meaningful instead of an empty preview.
+    shows something meaningful instead of an empty preview. Provider reasoning
+    is normalised into the ``<think>`` convention the workbench splits into
+    its Thinking panel — either from the langchain message or, when the
+    conversion dropped it, from the wire-level capture (``extra_reasoning``).
     """
-    content = _message_content(message)
+    content = _with_thinking(_message_content(message), message)
+    reasoning = (_reasoning_of(message) or (extra_reasoning or "")).strip()
+    if reasoning and "<think>" not in content.lower():
+        content = (
+            f"<think>{reasoning}</think>\n{content}"
+            if content.strip()
+            else f"<think>{reasoning}</think>"
+        )
     if content.strip():
         return content
     # pylint: disable=import-outside-toplevel
@@ -522,12 +606,28 @@ def _llm_result_text(message: AIMessage) -> str:
     return "\n".join(lines)
 
 
+def _wire_reasoning(wire_raw: dict[str, Any] | None) -> str | None:
+    """Reasoning text from an observe-only wire capture, when present."""
+    if not isinstance(wire_raw, dict):
+        return None
+    response = wire_raw.get("gen_ai.response")
+    if not isinstance(response, dict):
+        return None
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    value = message.get("reasoning_content") if isinstance(message, dict) else None
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _complete_llm_step_sync(
     session: ReplaySession,
     step: Step,
     payload: dict[str, Any],
     call_kwargs: dict[str, Any],
     message: AIMessage,
+    wire_raw: dict[str, Any] | None = None,
 ) -> None:
     # pylint: disable=import-outside-toplevel
     from agent_timetravel.stepping import complete_step_sync
@@ -536,7 +636,7 @@ def _complete_llm_step_sync(
     complete_step_sync(
         session,
         step,
-        _llm_result_text(message),
+        _llm_result_text(message, _wire_reasoning(wire_raw)),
         usage=_llm_usage(payload, call_kwargs, message),
     )
 
@@ -547,6 +647,7 @@ async def _complete_llm_step(
     payload: dict[str, Any],
     call_kwargs: dict[str, Any],
     message: AIMessage,
+    wire_raw: dict[str, Any] | None = None,
 ) -> None:
     # pylint: disable=import-outside-toplevel
     from agent_timetravel.stepping import complete_step
@@ -555,7 +656,7 @@ async def _complete_llm_step(
     await complete_step(
         session,
         step,
-        _llm_result_text(message),
+        _llm_result_text(message, _wire_reasoning(wire_raw)),
         usage=_llm_usage(payload, call_kwargs, message),
     )
 
@@ -587,11 +688,17 @@ def _dispatch_llm_sync(
         message = _materialise_message(recorded)
         _complete_llm_step_sync(session, step, recorded.payload, call_kwargs, message)
         return message
-    result = orig_invoke(model, forward_input, config, stop=stop, **forward_kwargs)
+    # pylint: disable=import-outside-toplevel
+    from agent_timetravel.openai_intercept import capture_only
+    # pylint: enable=import-outside-toplevel
+
+    with capture_only() as wire_holder:
+        result = orig_invoke(model, forward_input, config, stop=stop, **forward_kwargs)
+    wire_raw = (wire_holder or {}).get("raw")
     raw = _capture_live_llm_span(
-        session, model=model, result=result, signature=signature
+        session, model=model, result=result, signature=signature, wire_raw=wire_raw
     )
-    _complete_llm_step_sync(session, step, raw, call_kwargs, result)
+    _complete_llm_step_sync(session, step, raw, call_kwargs, result, wire_raw)
     return result
 
 
@@ -622,11 +729,20 @@ async def _dispatch_llm_async(
         message = _materialise_message(recorded)
         await _complete_llm_step(session, step, recorded.payload, call_kwargs, message)
         return message
-    result = await orig_ainvoke(model, forward_input, config, stop=stop, **forward_kwargs)
+    # Observe-only wire capture: langchain-openai drops provider reasoning
+    # (``reasoning_content``) during message conversion, so grab the raw SDK
+    # response underneath and merge what the AIMessage lost.
+    # pylint: disable=import-outside-toplevel
+    from agent_timetravel.openai_intercept import capture_only
+    # pylint: enable=import-outside-toplevel
+
+    with capture_only() as wire_holder:
+        result = await orig_ainvoke(model, forward_input, config, stop=stop, **forward_kwargs)
+    wire_raw = (wire_holder or {}).get("raw")
     raw = _capture_live_llm_span(
-        session, model=model, result=result, signature=signature
+        session, model=model, result=result, signature=signature, wire_raw=wire_raw
     )
-    await _complete_llm_step(session, step, raw, call_kwargs, result)
+    await _complete_llm_step(session, step, raw, call_kwargs, result, wire_raw)
     return result
 
 
