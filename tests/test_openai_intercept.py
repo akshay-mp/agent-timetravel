@@ -32,6 +32,7 @@ from agent_timetravel.openai_intercept import (
     InterceptError,
     _dispatch_async,
     _dispatch_sync,
+    _extract_usage,
     _step_async,
     _step_sync,
     extract_signature,
@@ -164,6 +165,22 @@ def test_extract_signature_empty_messages_yields_stable_hash() -> None:
     """Missing or empty messages produce a stable hash (not a crash)."""
     sig = extract_signature(model="x", messages=[])
     assert sig.messages_hash == hash_payload([])
+
+
+def test_extract_usage_caps_thinking_to_provider_completion_tokens() -> None:
+    """Provider usage must keep thinking plus final tokens within output."""
+    usage = _extract_usage(
+        {
+            "gen_ai.response": {
+                "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5}
+            }
+        },
+        {"messages": []},
+        "<think>this is deliberately much longer than one token</think>answer",
+    )
+
+    assert usage["thinking_tokens"] + usage["final_tokens"] == usage["output_tokens"] == 1
+    assert usage["estimated"] is False
 
 
 def test_step_async_captures_structured_sampling_snapshot(

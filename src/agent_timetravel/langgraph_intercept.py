@@ -311,7 +311,11 @@ def _reasoning_of(message: AIMessage) -> str:
     # pylint: disable=import-outside-toplevel
     additional = getattr(message, "additional_kwargs", None) or {}
     # pylint: enable=import-outside-toplevel
-    for source in (getattr(message, "reasoning_content", None), additional.get("reasoning_content"), additional.get("reasoning")):
+    for source in (
+        getattr(message, "reasoning_content", None),
+        additional.get("reasoning_content"),
+        additional.get("reasoning"),
+    ):
         if isinstance(source, str) and source.strip():
             return source.strip()
     return ""
@@ -546,6 +550,7 @@ def _llm_usage(
     payload: dict[str, Any],
     call_kwargs: dict[str, Any],
     message: AIMessage,
+    extra_reasoning: str | None = None,
 ) -> dict[str, int]:
     """Token accounting with the shared OpenAI-path estimator as fallback.
 
@@ -571,8 +576,21 @@ def _llm_usage(
     return _extract_usage(
         effective,
         {"messages": call_kwargs["messages"]},
-        _with_thinking(_message_content(message), message),
+        _llm_text_with_reasoning(message, extra_reasoning),
     )
+
+
+def _llm_text_with_reasoning(message: AIMessage, extra_reasoning: str | None = None) -> str:
+    """Return actual model text with message/wire reasoning in a think block."""
+    content = _with_thinking(_message_content(message), message)
+    reasoning = (_reasoning_of(message) or (extra_reasoning or "")).strip()
+    if reasoning and "<think>" not in content.lower():
+        content = (
+            f"<think>{reasoning}</think>\n{content}"
+            if content.strip()
+            else f"<think>{reasoning}</think>"
+        )
+    return content
 
 
 def _llm_result_text(message: AIMessage, extra_reasoning: str | None = None) -> str:
@@ -585,14 +603,7 @@ def _llm_result_text(message: AIMessage, extra_reasoning: str | None = None) -> 
     its Thinking panel — either from the langchain message or, when the
     conversion dropped it, from the wire-level capture (``extra_reasoning``).
     """
-    content = _with_thinking(_message_content(message), message)
-    reasoning = (_reasoning_of(message) or (extra_reasoning or "")).strip()
-    if reasoning and "<think>" not in content.lower():
-        content = (
-            f"<think>{reasoning}</think>\n{content}"
-            if content.strip()
-            else f"<think>{reasoning}</think>"
-        )
+    content = _llm_text_with_reasoning(message, extra_reasoning)
     if content.strip():
         return content
     # pylint: disable=import-outside-toplevel
@@ -633,11 +644,12 @@ def _complete_llm_step_sync(
     from agent_timetravel.stepping import complete_step_sync
     # pylint: enable=import-outside-toplevel
 
+    wire_reasoning = _wire_reasoning(wire_raw)
     complete_step_sync(
         session,
         step,
-        _llm_result_text(message, _wire_reasoning(wire_raw)),
-        usage=_llm_usage(payload, call_kwargs, message),
+        _llm_result_text(message, wire_reasoning),
+        usage=_llm_usage(payload, call_kwargs, message, wire_reasoning),
     )
 
 
@@ -653,11 +665,12 @@ async def _complete_llm_step(
     from agent_timetravel.stepping import complete_step
     # pylint: enable=import-outside-toplevel
 
+    wire_reasoning = _wire_reasoning(wire_raw)
     await complete_step(
         session,
         step,
-        _llm_result_text(message, _wire_reasoning(wire_raw)),
-        usage=_llm_usage(payload, call_kwargs, message),
+        _llm_result_text(message, wire_reasoning),
+        usage=_llm_usage(payload, call_kwargs, message, wire_reasoning),
     )
 
 

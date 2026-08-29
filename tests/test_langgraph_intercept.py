@@ -590,6 +590,43 @@ def test_llm_result_text_summarizes_tool_call_steps() -> None:
     assert _llm_result_text(AIMessage(content="plain answer")) == "plain answer"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {
+            "gen_ai.response": {
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                }
+            }
+        },
+    ],
+)
+def test_llm_usage_estimate_ignores_tool_call_preview(payload: dict[str, Any]) -> None:
+    """Fallback usage does not count the UI-only tool-call summary."""
+    from agent_timetravel.langgraph_intercept import _llm_usage
+
+    message = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "search", "args": {"query": "dpo"}, "id": "c1", "type": "tool_call"}
+        ],
+    )
+    usage = _llm_usage(
+        payload,
+        {"messages": [{"role": "user", "content": "hello"}]},
+        message,
+    )
+
+    assert usage["estimated"] is True
+    assert usage["thinking_tokens"] == 0
+    assert usage["final_tokens"] == 0
+    assert usage["output_tokens"] == 0
+
+
 def test_edited_tool_args_reach_the_live_tool(store: TraceStore, trace_id: str) -> None:
     """EDIT rewrites what the tool actually executes, not just the view."""
     _seed_trace(store, trace_id, [])
@@ -832,7 +869,7 @@ def test_async_invoke_persists_reasoning_in_span(
     from agent_timetravel.replay import replay as replay_ctx
 
     _seed_trace(store, trace_id, [])
-    model, tracker = _fake_model()
+    model, _tracker = _fake_model()
     # Inject reasoning through additional_kwargs on the async path the
     # scenario actually exercises (ainvoke -> _agenerate).
     original_agenerate = type(model)._agenerate  # type: ignore[attr-defined]
@@ -870,12 +907,8 @@ def test_materialise_message_restores_reasoning(
     """Frozen replay rebuilds reasoning into additional_kwargs for display."""
     from langchain_core.messages import HumanMessage
 
-    from agent_timetravel.enums import ReplayMode
     from agent_timetravel.enums import SpanStatus
-    from agent_timetravel.langgraph_intercept import (
-        _materialise_message,
-        patch,
-    )
+    from agent_timetravel.langgraph_intercept import _materialise_message
     from agent_timetravel.models import Span, hash_payload
     from agent_timetravel.replay import RecordedResponse
 
@@ -931,14 +964,25 @@ def test_async_invoke_merges_wire_reasoning_into_span_and_result(
 
     from agent_timetravel.enums import ReplayMode
     from agent_timetravel.langgraph_intercept import patch
-    from agent_timetravel.openai_intercept import _wire_raw_holder, capture_only
+    from agent_timetravel.openai_intercept import _wire_raw_holder
     from agent_timetravel.replay import replay as replay_ctx
 
     _seed_trace(store, trace_id, [])
     model, _tracker = _fake_model()
     channel = AsyncioChannel()
+    completed: list[tuple[str, dict[str, int] | None]] = []
 
-    async def ainvoke_with_wire(self: Any, input: Any, config: Any = None, **kwargs: Any) -> Any:
+    async def capture_complete(
+        _session: Any,
+        _step: Any,
+        result: str,
+        usage: dict[str, int] | None = None,
+    ) -> None:
+        completed.append((result, usage))
+
+    monkeypatch.setattr("agent_timetravel.stepping.complete_step", capture_complete)
+
+    async def ainvoke_with_wire(self: Any, _input: Any, config: Any = None, **kwargs: Any) -> Any:
         # Simulate the OpenAI SDK layer observing the call under capture-only.
         holder = _wire_raw_holder()
         if holder is not None:
@@ -950,7 +994,7 @@ def test_async_invoke_merges_wire_reasoning_into_span_and_result(
                             "message": {
                                 "role": "assistant",
                                 "content": "",
-                                "reasoning_content": "wire-level reasoning",
+                                "reasoning_content": "wire thought",
                                 "tool_calls": [
                                     {
                                         "id": "call_1",
@@ -997,6 +1041,90 @@ def test_async_invoke_merges_wire_reasoning_into_span_and_result(
     spans = store.get_spans(trace_id, branch_id=branch_id)
     stored = spans[0].raw_attributes["gen_ai.response"]["choices"][0]["message"]
     # The wire payload (reasoning + OpenAI-form tool calls + usage) was stored.
-    assert stored["reasoning_content"] == "wire-level reasoning"
+    assert stored["reasoning_content"] == "wire thought"
     assert stored["tool_calls"][0]["function"]["name"] == "search"
     assert spans[0].total_tokens == 11
+    assert completed == [
+        (
+            "<think>wire thought</think>",
+            {
+                "input_tokens": 7,
+                "output_tokens": 4,
+                "thinking_tokens": 3,
+                "final_tokens": 1,
+                "total_tokens": 11,
+                "estimated": False,
+            },
+        )
+    ]
+
+
+def test_sync_invoke_uses_wire_reasoning_for_step_usage(
+    store: TraceStore, trace_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sync live-forward completion accounts for reasoning lost by LangChain."""
+    from agent_timetravel.langgraph_intercept import patch
+    from agent_timetravel.openai_intercept import _wire_raw_holder
+
+    _seed_trace(store, trace_id, [])
+    model, _tracker = _fake_model()
+    channel = ThreadBridgeChannel()
+    completed: list[dict[str, int] | None] = []
+
+    def capture_complete_sync(
+        _session: Any,
+        _step: Any,
+        _result: str,
+        usage: dict[str, int] | None = None,
+    ) -> None:
+        completed.append(usage)
+
+    monkeypatch.setattr(
+        "agent_timetravel.stepping.complete_step_sync", capture_complete_sync
+    )
+
+    def invoke_with_wire(self: Any, _input: Any, config: Any = None, **kwargs: Any) -> Any:
+        holder = _wire_raw_holder()
+        if holder is not None:
+            holder["raw"] = {
+                "gen_ai.response": {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": "wire thought",
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 4,
+                        "total_tokens": 11,
+                    },
+                }
+            }
+        return AIMessage(content="")
+
+    monkeypatch.setattr(
+        "langchain_core.language_models.chat_models.BaseChatModel.invoke",
+        invoke_with_wire,
+    )
+
+    with patch(), replay_ctx(
+        store, trace_id, mode=ReplayMode.INTERACTIVE, approval=channel
+    ):
+        approver = _start_approver(channel, Decision(kind=DecisionKind.APPROVE))
+        model.invoke([HumanMessage(content="hello")])
+        approver.join(timeout=2)
+
+    assert completed == [
+        {
+            "input_tokens": 7,
+            "output_tokens": 4,
+            "thinking_tokens": 3,
+            "final_tokens": 1,
+            "total_tokens": 11,
+            "estimated": False,
+        }
+    ]

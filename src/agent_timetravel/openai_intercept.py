@@ -27,7 +27,7 @@ idempotent — nested ``with patch():`` calls do not double-restore.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -289,10 +289,8 @@ def _response_to_raw(response: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     parse = getattr(response, "parse", None)
     # pylint: enable=import-outside-toplevel
     if parse is not None and not isinstance(response, dict):
-        try:
+        with suppress(Exception):
             response = parse()
-        except Exception:  # pragma: no cover - parse failure keeps the wrapper
-            pass
     payload = _to_jsonable(response)
     raw: dict[str, Any] = {}
     raw["gen_ai.request.model"] = str(kwargs.get("model", ""))
@@ -724,7 +722,7 @@ def _extract_usage(
     thinking_text, final_text = _split_thinking(response_text)
     if has_provider_usage:
         completion_tokens = output_tokens or 0
-        thinking_tokens = _estimate_tokens(thinking_text)
+        thinking_tokens = min(_estimate_tokens(thinking_text), completion_tokens)
         return {
             "input_tokens": input_tokens or 0,
             "output_tokens": completion_tokens,
