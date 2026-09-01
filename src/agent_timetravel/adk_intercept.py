@@ -50,6 +50,7 @@ from contextvars import ContextVar
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
+from agent_timetravel.ingest import parse_openinference_messages
 from agent_timetravel.openai_intercept import (
     _build_llm_step,
     _to_jsonable,
@@ -364,11 +365,7 @@ async def _dispatch_llm_async(
 
 def _call_kwargs(model: Any, llm_request: Any) -> dict[str, Any]:
     """Assemble the ``{model, messages, tools, **params}`` step-view kwargs."""
-    # pylint: disable=import-outside-toplevel
-    from agent_timetravel.adapters.adk import _messages_from_adk
-    # pylint: enable=import-outside-toplevel
-
-    messages = _to_jsonable(_messages_from_adk(llm_request))
+    messages = _canonical_messages_from_adk(llm_request)
     tools = _tools_from_adk(llm_request)
     return {
         "model": _request_model_name(model, llm_request),
@@ -376,6 +373,69 @@ def _call_kwargs(model: Any, llm_request: Any) -> dict[str, Any]:
         "tools": tools,
         **_config_params(llm_request),
     }
+
+
+def _canonical_messages_from_adk(llm_request: Any) -> list[dict[str, Any]]:
+    """Extract the compact message shape shared with ingest's flat parser."""
+    import json
+
+    contents = getattr(llm_request, "contents", None) or []
+    messages: list[dict[str, Any]] = []
+    for content in contents:
+        if isinstance(content, dict):
+            role = content.get("role", "user")
+            parts = content.get("parts") or []
+        else:
+            role = getattr(content, "role", "user")
+            parts = getattr(content, "parts", None) or []
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        function_responses: list[dict[str, Any]] = []
+        for part in parts:
+            if isinstance(part, str):
+                text_parts.append(part)
+                continue
+            value = _to_jsonable(part)
+            if not isinstance(value, dict):
+                continue
+            text = value.get("text")
+            if text:
+                text_parts.append(str(text))
+            function_call = value.get("function_call")
+            if isinstance(function_call, dict) and isinstance(function_call.get("name"), str):
+                tool_calls.append(
+                    {
+                        "name": function_call["name"],
+                        "args": function_call.get("args") or {},
+                        "id": function_call.get("id") or "",
+                        "type": "tool_call",
+                    }
+                )
+            function_response = value.get("function_response")
+            if isinstance(function_response, dict):
+                name = function_response.get("name")
+                if isinstance(name, str):
+                    response = function_response.get("response") or {}
+                    function_responses.append(
+                        {
+                            "role": "tool",
+                            "content": json.dumps(
+                                response, sort_keys=True, separators=(",", ":"), default=str
+                            ),
+                            "name": name,
+                            "tool_call_id": function_response.get("id") or "",
+                        }
+                    )
+        message: dict[str, Any] = {
+            "role": "assistant" if role in ("model", "assistant") else str(role or "user"),
+            "content": "\n".join(text_parts),
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        if text_parts or tool_calls or not function_responses:
+            messages.append(message)
+        messages.extend(function_responses)
+    return messages
 
 
 def _request_model_name(model: Any, llm_request: Any) -> str:
@@ -448,37 +508,19 @@ def _materialise_response(recorded: RecordedResponse, model_name: str) -> Any:
     # pylint: enable=import-outside-toplevel
 
     payload = recorded.payload or {}
-    response = (
-        payload.get("gen_ai.response")
-        or payload.get("raw_response")
-        or payload.get("response")
-        or {}
-    )
-    message: dict[str, Any] = {}
-    if isinstance(response, dict):
-        choices = response.get("choices") or []
-        first = choices[0] if isinstance(choices, list) and choices else None
-        candidate = first.get("message") if isinstance(first, dict) else None
-        if isinstance(candidate, dict):
-            message = candidate
-    if not message:
-        for key, value in payload.items():
-            if (
-                key.startswith("llm.output_messages.")
-                and key.endswith(".message.content")
-                and isinstance(value, str)
-            ):
-                message = {"content": value}
-                break
+    message = _recorded_message(payload)
 
     content = message.get("content") or ""
     try:
         parts: list[Any] = [types.Part(text=content)] if content else []
         for call in message.get("tool_calls") or []:
-            name, call_args = _parse_recorded_tool_call(call)
+            name, call_args, call_id = _parse_recorded_tool_call(call)
             if name is not None:
+                function_call: dict[str, Any] = {"name": name, "args": call_args}
+                if call_id:
+                    function_call["id"] = call_id
                 parts.append(
-                    types.Part(function_call=types.FunctionCall(name=name, args=call_args))
+                    types.Part(function_call=types.FunctionCall(**function_call))
                 )
         if not parts:
             parts = [types.Part(text="")]
@@ -491,27 +533,31 @@ def _materialise_response(recorded: RecordedResponse, model_name: str) -> Any:
         return _llm_response_from_text(str(content), model=model_name)
 
 
-def _parse_recorded_tool_call(call: Any) -> tuple[str | None, dict[str, Any]]:
-    """Normalise a stored tool call (OpenAI wire or native form) to name/args."""
+def _parse_recorded_tool_call(call: Any) -> tuple[str | None, dict[str, Any], str]:
+    """Normalise a stored tool call to its name, args, and optional id."""
     # pylint: disable=import-outside-toplevel
     import json
     # pylint: enable=import-outside-toplevel
 
     if not isinstance(call, dict):
-        return None, {}
+        return None, {}, ""
     if isinstance(call.get("function"), dict):  # OpenAI wire form
         name = call["function"].get("name")
         arguments = call["function"].get("arguments")
-        args: dict[str, Any] = (
-            json.loads(arguments) if isinstance(arguments, str) and arguments.strip() else {}
-        )
+        call_id = call.get("id")
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except (TypeError, ValueError):
+            parsed = {}
+        args = parsed if isinstance(parsed, dict) else {}
     else:  # native form
         name = call.get("name")
         native_args = call.get("args")
         args = native_args if isinstance(native_args, dict) else {}
+        call_id = call.get("id")
     if not isinstance(name, str):
-        return None, {}
-    return name, args
+        return None, {}, ""
+    return name, args, str(call_id or "")
 
 
 def _response_text(result: Any) -> str:
@@ -541,12 +587,12 @@ def _function_calls_of(result: Any) -> list[dict[str, Any]]:
         if not isinstance(name, str):
             continue
         calls.append(
-            {
-                "name": name,
-                "args": getattr(function_call, "args", None) or {},
-                "id": "",
-                "type": "tool_call",
-            }
+                {
+                    "name": name,
+                    "args": getattr(function_call, "args", None) or {},
+                    "id": getattr(function_call, "id", None) or "",
+                    "type": "tool_call",
+                }
         )
     return calls
 
@@ -571,19 +617,7 @@ def _usage_of(result: Any) -> dict[str, int]:
 def _recorded_result_text(recorded: RecordedResponse) -> str:
     """Debugger result text for a replayed call (text + tool-call summary)."""
     payload = recorded.payload or {}
-    response = (
-        payload.get("gen_ai.response")
-        or payload.get("raw_response")
-        or payload.get("response")
-        or {}
-    )
-    message: dict[str, Any] = {}
-    if isinstance(response, dict):
-        choices = response.get("choices") or []
-        first = choices[0] if isinstance(choices, list) and choices else None
-        candidate = first.get("message") if isinstance(first, dict) else None
-        if isinstance(candidate, dict):
-            message = candidate
+    message = _recorded_message(payload)
     content = str(message.get("content") or "")
     calls = message.get("tool_calls") or []
     if content.strip() or not calls:
@@ -594,10 +628,28 @@ def _recorded_result_text(recorded: RecordedResponse) -> str:
 
     lines = []
     for call in calls:
-        name, call_args = _parse_recorded_tool_call(call)
+        name, call_args, _call_id = _parse_recorded_tool_call(call)
         if name is not None:
             lines.append(f"→ {name}({json.dumps(call_args, default=str)})")
     return "\n".join(lines)
+
+
+def _recorded_message(payload: dict[str, Any]) -> dict[str, Any]:
+    """Extract the first nested or flattened OpenInference output message."""
+    response = (
+        payload.get("gen_ai.response")
+        or payload.get("raw_response")
+        or payload.get("response")
+        or {}
+    )
+    if isinstance(response, dict):
+        choices = response.get("choices") or []
+        first = choices[0] if isinstance(choices, list) and choices else None
+        candidate = first.get("message") if isinstance(first, dict) else None
+        if isinstance(candidate, dict):
+            return candidate
+    flat_messages = parse_openinference_messages(payload, prefix="llm.output_messages")
+    return flat_messages[0] if flat_messages else {}
 
 
 def _response_result_text(result: Any) -> str:
@@ -679,7 +731,12 @@ def _capture_live_llm_span(
         )
     else:
         span.raw_attributes = raw
-        span.total_tokens = usage.get("total") or span.total_tokens
+        if "prompt" in usage:
+            span.prompt_tokens = usage["prompt"]
+        if "completion" in usage:
+            span.completion_tokens = usage["completion"]
+        if "total" in usage:
+            span.total_tokens = usage["total"]
     session.record_new(span)
     return span
 

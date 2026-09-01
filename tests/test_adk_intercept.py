@@ -17,13 +17,16 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import pytest
 
 from agent_timetravel.enums import ReplayMode, SpanKind
 from agent_timetravel.models import Span, Trace, hash_payload
 from agent_timetravel.openai_intercept import _to_jsonable
+from agent_timetravel.replay import RecordedResponse
 from agent_timetravel.replay import replay as replay_ctx
 from agent_timetravel.stepping import (
     AsyncioChannel,
@@ -42,7 +45,14 @@ from google.adk.tools import BaseTool as AdkBaseTool
 from google.genai import types
 
 from agent_timetravel.adapters.adk import _messages_from_adk
-from agent_timetravel.adk_intercept import patch
+from agent_timetravel.adk_intercept import (
+    _canonical_messages_from_adk,
+    _capture_live_llm_span,
+    _function_calls_of,
+    _materialise_response,
+    _recorded_result_text,
+    patch,
+)
 
 # pylint: enable=import-outside-toplevel
 
@@ -276,8 +286,6 @@ def test_generate_gates_and_captures(store: TraceStore, trace_id: str) -> None:
         approver.cancel()
         return str(session.branch_id)
 
-    from uuid import UUID
-
     branch_id = UUID(asyncio.run(scenario()))
     assert len(tracker) == 1
     spans = store.get_spans(trace_id, branch_id=branch_id)
@@ -286,7 +294,7 @@ def test_generate_gates_and_captures(store: TraceStore, trace_id: str) -> None:
     assert span.kind == SpanKind.LLM
     assert span.name == "adk.adk-test"
     assert span.messages_hash == hash_payload(
-        _to_jsonable(_messages_from_adk(_llm_request("hello")))
+        _canonical_messages_from_adk(_llm_request("hello"))
     )
     assert (
         span.raw_attributes["gen_ai.response"]["choices"][0]["message"]["content"] == "echo:hello"
@@ -314,14 +322,12 @@ def test_edit_rewrites_outbound_contents(store: TraceStore, trace_id: str) -> No
         approver.cancel()
         return str(session.branch_id)
 
-    from uuid import UUID
-
     branch_id = UUID(asyncio.run(scenario()))
     assert tracker[0] == ["edited prompt"]
     # The captured span must describe the edited call, not the original one.
     span = store.get_spans(trace_id, branch_id=branch_id)[0]
     assert span.messages_hash == hash_payload(
-        _to_jsonable(_messages_from_adk(_llm_request("edited prompt")))
+        _canonical_messages_from_adk(_llm_request("edited prompt"))
     )
 
 
@@ -350,7 +356,7 @@ def test_stop_unwinds(store: TraceStore, trace_id: str) -> None:
 
 
 def test_frozen_replay_serves_recorded(store: TraceStore, trace_id: str) -> None:
-    recorded_messages = _messages_from_adk(_llm_request("hello"))
+    recorded_messages = _canonical_messages_from_adk(_llm_request("hello"))
     _seed_trace(store, trace_id, [_recorded_llm_span(trace_id, recorded_messages)])
     model, tracker = _fake_llm()
 
@@ -368,7 +374,7 @@ def test_frozen_replay_serves_recorded(store: TraceStore, trace_id: str) -> None
 def test_frozen_divergence_fails_closed(store: TraceStore, trace_id: str) -> None:
     from agent_timetravel.replay import ReplayError
 
-    recorded_messages = _messages_from_adk(_llm_request("hello"))
+    recorded_messages = _canonical_messages_from_adk(_llm_request("hello"))
     _seed_trace(store, trace_id, [_recorded_llm_span(trace_id, recorded_messages)])
     model, _tracker = _fake_llm()
 
@@ -382,7 +388,7 @@ def test_frozen_divergence_fails_closed(store: TraceStore, trace_id: str) -> Non
 
 
 def test_branch_replay_captures_divergence(store: TraceStore, trace_id: str) -> None:
-    recorded_messages = _messages_from_adk(_llm_request("hello"))
+    recorded_messages = _canonical_messages_from_adk(_llm_request("hello"))
     _seed_trace(store, trace_id, [_recorded_llm_span(trace_id, recorded_messages)])
     model, tracker = _fake_llm()
 
@@ -462,8 +468,6 @@ def test_replay_llm_wrapper_branch_records_single_span(store: TraceStore, trace_
                 pass
             return str(session.branch_id)
 
-    from uuid import UUID
-
     branch_id = UUID(asyncio.run(scenario()))
     live_spans = [
         span
@@ -519,7 +523,7 @@ def test_tool_calling_trace_replays_through_interceptor(store: TraceStore, trace
         )
     ]
     tools_hash = hash_payload(_to_jsonable(request.config.tools))
-    recorded_messages = _messages_from_adk(request)
+    recorded_messages = _canonical_messages_from_adk(request)
     _seed_trace(
         store,
         trace_id,
@@ -536,6 +540,143 @@ def test_tool_calling_trace_replays_through_interceptor(store: TraceStore, trace
 
     assert asyncio.run(scenario()) == ["recorded"]
     assert tracker == []
+
+
+def test_function_response_history_matches_flat_openinference_shape() -> None:
+    """ADK tool-loop history hashes like its flattened OI representation."""
+    request = LlmRequest(
+        model="adk-test",
+        contents=[
+            types.Content(role="user", parts=[types.Part(text="Weather?")]),
+            types.Content(
+                role="model",
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="weather", args={"city": "Boston"}, id="call_1"
+                        )
+                    )
+                ],
+            ),
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name="weather", response={"temp": 72}, id="call_1"
+                        )
+                    )
+                ],
+            ),
+        ],
+    )
+    expected = [
+        {"role": "user", "content": "Weather?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "name": "weather",
+                    "args": {"city": "Boston"},
+                    "id": "call_1",
+                    "type": "tool_call",
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": '{"temp":72}',
+            "name": "weather",
+            "tool_call_id": "call_1",
+        },
+    ]
+    assert _canonical_messages_from_adk(request) == expected
+    assert hash_payload(_canonical_messages_from_adk(request)) == hash_payload(expected)
+
+
+def test_live_function_call_capture_preserves_id() -> None:
+    result = _response("")
+    result.content.parts = [
+        types.Part(
+            function_call=types.FunctionCall(
+                name="weather", args={"city": "Boston"}, id="call_1"
+            )
+        )
+    ]
+    assert _function_calls_of(result)[0]["id"] == "call_1"
+
+
+def test_streaming_capture_refreshes_typed_usage(
+    store: TraceStore, trace_id: str
+) -> None:
+    store.upsert_trace(Trace(trace_id=trace_id, spans=[]))
+    first = _response("partial")
+    first.usage_metadata = None
+    final = _response("final")
+
+    with replay_ctx(store, trace_id, mode=ReplayMode.BRANCH) as session:
+        span = _capture_live_llm_span(
+            session,
+            model_name="adk-test",
+            messages=_canonical_messages_from_adk(_llm_request("hello")),
+            signature=SimpleNamespace(messages_hash="messages", tools_hash=None),
+            result=first,
+        )
+        _capture_live_llm_span(
+            session,
+            model_name="adk-test",
+            messages=_canonical_messages_from_adk(_llm_request("hello")),
+            signature=SimpleNamespace(messages_hash="messages", tools_hash=None),
+            result=final,
+            span=span,
+        )
+
+    assert span.prompt_tokens == 5
+    assert span.completion_tokens == 3
+    assert span.total_tokens == 8
+    assert len(store.get_spans(trace_id, branch_id=session.branch_id)) == 1
+
+
+def test_flat_output_materialises_text_and_tool_call() -> None:
+    recorded = RecordedResponse(
+        payload={
+            "llm.output_messages.0.message.role": "assistant",
+            "llm.output_messages.0.message.content": "I will check that.",
+            "llm.output_messages.0.message.tool_calls.0.tool_call.id": "call_1",
+            "llm.output_messages.0.message.tool_calls.0.tool_call.function.name": "weather",
+            "llm.output_messages.0.message.tool_calls.0.tool_call.function.arguments":
+                '{"city":"Boston"}',
+        },
+        span_id="a" * 16,
+        timetravel_id=UUID("00000000-0000-0000-0000-000000000001"),
+    )
+
+    response = _materialise_response(recorded, "adk-test")
+    parts = response.content.parts
+    assert parts[0].text == "I will check that."
+    assert parts[1].function_call.name == "weather"
+    assert parts[1].function_call.args == {"city": "Boston"}
+    assert parts[1].function_call.id == "call_1"
+    assert _recorded_result_text(recorded) == "I will check that."
+
+
+def test_flat_output_materialises_ordered_tool_use_without_text() -> None:
+    recorded = RecordedResponse(
+        payload={
+            "llm.output_messages.0.message.role": "assistant",
+            "llm.output_messages.0.message.contents.0.message_content.type": "tool_use",
+            "llm.output_messages.0.message.contents.0.tool_call.id": "call_2",
+            "llm.output_messages.0.message.contents.0.tool_call.function.name": "lookup",
+            "llm.output_messages.0.message.contents.0.tool_call.function.arguments": "{}",
+        },
+        span_id="b" * 16,
+        timetravel_id=UUID("00000000-0000-0000-0000-000000000002"),
+    )
+
+    response = _materialise_response(recorded, "adk-test")
+    assert response.content.parts[0].function_call.name == "lookup"
+    assert _recorded_result_text(recorded) == '→ lookup({})'
 
 
 def test_staticmethod_override_passthrough() -> None:

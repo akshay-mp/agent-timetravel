@@ -17,6 +17,8 @@ OpenInference exporters may use either.
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -52,6 +54,14 @@ _PROMOTED = {
     "gen_ai.usage.completion_tokens",
     "gen_ai.usage.total_tokens",
 }
+
+_FLAT_MESSAGE_RE = re.compile(r"^(?P<prefix>.+)\.(?P<index>\d+)\.message\.(?P<field>.+)$")
+_FLAT_CONTENT_RE = re.compile(
+    r"^contents\.(?P<index>\d+)\.(?P<field>message_content\.(?:text|type)|tool_call\..+)$"
+)
+_FLAT_TOOL_CALL_RE = re.compile(
+    r"^tool_calls\.(?P<index>\d+)\.(?P<field>tool_call\..+)$"
+)
 
 
 class IngestError(ValueError):
@@ -188,6 +198,10 @@ def _hashes_for_kind(kind: SpanKind, raw: dict[str, Any]) -> tuple[str | None, s
         "gen_ai.prompt",
         "gen_ai.input.messages",
     )
+    if messages_payload is None:
+        flattened_messages = parse_openinference_messages(raw)
+        if flattened_messages:
+            messages_payload = flattened_messages
     tools_payload = _first_present(
         raw,
         "llm.tools",
@@ -196,6 +210,140 @@ def _hashes_for_kind(kind: SpanKind, raw: dict[str, Any]) -> tuple[str | None, s
     messages_hash = hash_payload(messages_payload) if messages_payload is not None else None
     tools_hash = hash_payload(tools_payload) if tools_payload is not None else None
     return messages_hash, tools_hash
+
+
+def parse_openinference_messages(
+    attributes: dict[str, Any],
+    *,
+    prefix: str = "llm.input_messages",
+) -> list[dict[str, Any]]:
+    """Rebuild compact messages from OpenInference's flattened attributes.
+
+    The result deliberately matches the small message shape used by the ADK
+    interceptor: ``role`` + flattened text ``content`` and, when present,
+    native ``tool_calls`` entries with ``name``/``args``/``id``/``type``.
+    Both conventional ``message.tool_calls`` and ordered ``message.contents``
+    tool-use items are accepted. Malformed or unsupported fields are ignored.
+    """
+    messages: dict[int, dict[str, Any]] = {}
+    for key, value in attributes.items():
+        match = _FLAT_MESSAGE_RE.match(key)
+        if match is None or match.group("prefix") != prefix:
+            continue
+        index = int(match.group("index"))
+        messages.setdefault(index, {})[match.group("field")] = value
+
+    out: list[dict[str, Any]] = []
+    for index in sorted(messages):
+        fields = messages[index]
+        message: dict[str, Any] = {
+            "role": _as_str(fields.get("role")) or "user",
+            "content": _as_message_content(fields.get("content")),
+        }
+        if "name" in fields:
+            message["name"] = str(fields["name"])
+        if "tool_call_id" in fields:
+            message["tool_call_id"] = str(fields["tool_call_id"])
+        if message["role"] == "model":
+            message["role"] = "assistant"
+        if message["role"] == "tool":
+            message["content"] = _canonical_json_content(message["content"])
+
+        calls: list[dict[str, Any]] = []
+        for call_index in _flat_indexes(fields, _FLAT_TOOL_CALL_RE):
+            call = _tool_call_from_fields(_flat_group(fields, _FLAT_TOOL_CALL_RE, call_index))
+            _append_tool_call(calls, call)
+
+        direct_call = _tool_call_from_fields(
+            {
+                "tool_call.function.name": fields.get("function_call_name"),
+                "tool_call.function.arguments": fields.get(
+                    "function_call_arguments_json", fields.get("function_call_arguments")
+                ),
+            }
+        )
+        _append_tool_call(calls, direct_call)
+
+        content_text: list[str] = []
+        for content_index in _flat_indexes(fields, _FLAT_CONTENT_RE):
+            content_fields = _flat_group(fields, _FLAT_CONTENT_RE, content_index)
+            content_type = _as_str(content_fields.get("message_content.type"))
+            text = content_fields.get("message_content.text")
+            if content_type in (None, "text") and text is not None:
+                content_text.append(str(text))
+            if content_type == "tool_use":
+                _append_tool_call(calls, _tool_call_from_fields(content_fields))
+
+        if "content" not in fields and content_text:
+            message["content"] = "\n".join(content_text)
+        if calls:
+            message["tool_calls"] = calls
+        out.append(message)
+    return out
+
+
+def _flat_indexes(fields: dict[str, Any], pattern: re.Pattern[str]) -> list[int]:
+    indexes: set[int] = set()
+    for key in fields:
+        match = pattern.match(key)
+        if match is not None:
+            indexes.add(int(match.group("index")))
+    return sorted(indexes)
+
+
+def _flat_group(
+    fields: dict[str, Any], pattern: re.Pattern[str], index: int
+) -> dict[str, Any]:
+    prefix = f"tool_calls.{index}." if pattern is _FLAT_TOOL_CALL_RE else f"contents.{index}."
+    return {
+        match.group("field"): value
+        for key, value in fields.items()
+        if key.startswith(prefix) and (match := pattern.match(key)) is not None
+    }
+
+
+def _tool_call_from_fields(fields: dict[str, Any]) -> dict[str, Any] | None:
+    name = _as_str(fields.get("tool_call.function.name"))
+    if name is None:
+        return None
+    arguments = fields.get("tool_call.function.arguments")
+    if arguments is None:
+        arguments = fields.get("tool_call.function.arguments_json")
+    return {
+        "name": name,
+        "args": _tool_call_args(arguments),
+        "id": _as_str(fields.get("tool_call.id")) or "",
+        "type": "tool_call",
+    }
+
+
+def _tool_call_args(value: Any) -> dict[str, Any]:  # noqa: ANN401
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _append_tool_call(calls: list[dict[str, Any]], call: dict[str, Any] | None) -> None:
+    if call is not None and call not in calls:
+        calls.append(call)
+
+
+def _as_message_content(value: Any) -> str:  # noqa: ANN401
+    return "" if value is None else str(value)
+
+
+def _canonical_json_content(value: str) -> str:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return value
+    return json.dumps(parsed, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _first_present(d: dict[str, Any], *keys: str) -> Any | None:  # noqa: ANN401
@@ -290,5 +438,6 @@ __all__ = [
     "attrs_to_dict",
     "decode_export_request",
     "decode_export_request_json",
+    "parse_openinference_messages",
     "spans_from_request",
 ]

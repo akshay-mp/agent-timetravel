@@ -165,6 +165,94 @@ def test_no_session_delegates_to_wrapped(
     assert len(calls) == 1
 
 
+def test_abandoned_forward_stream_is_captured(
+    store: TraceStore, trace_id: str
+) -> None:
+    """A consumer stopping after the first chunk still leaves a branch span."""
+    store.upsert_trace(Trace(trace_id=trace_id, spans=[]))
+    wrapped, _calls = _wrapped_llm()
+
+    async def scenario() -> list[Any]:
+        with replay_ctx(store, trace_id, mode=ReplayMode.BRANCH) as session:
+            stream = wrapped.generate_content_async(_adk_request())
+            first = [response async for response in _take_one(stream)]
+            await stream.aclose()
+            assert len(session.recorded_spans()) == 1
+            return first
+
+    result = asyncio.run(scenario())
+    assert _llm_response_to_text(result[0]) == "live-partial"
+
+
+def test_manual_streaming_capture_preserves_typed_usage(
+    store: TraceStore, trace_id: str
+) -> None:
+    """Manual adapter streams update the single cached span's typed usage."""
+    from google.adk.models import BaseLlm
+
+    from agent_timetravel.adapters.adk import replay_llm
+
+    def usage_response(text: str) -> Any:
+        return SimpleNamespace(
+            content=SimpleNamespace(parts=[SimpleNamespace(text=text)]),
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=5,
+                candidates_token_count=3,
+                total_token_count=8,
+            ),
+        )
+
+    class _UsageLlm(BaseLlm):
+        model: str = "usage-test"
+
+        async def generate_content_async(
+            self, request: Any, stream: bool = False
+        ) -> Any:
+            yield usage_response("partial")
+            yield usage_response("final")
+
+    store.upsert_trace(Trace(trace_id=trace_id, spans=[]))
+    wrapped = replay_llm(_UsageLlm())
+
+    async def scenario() -> Any:
+        with replay_ctx(store, trace_id, mode=ReplayMode.BRANCH) as session:
+            [response async for response in wrapped.generate_content_async(_adk_request())]
+            return session.branch_id
+
+    branch_id = asyncio.run(scenario())
+    spans = store.get_spans(trace_id, branch_id=branch_id)
+    assert len(spans) == 1
+    assert spans[0].prompt_tokens == 5
+    assert spans[0].completion_tokens == 3
+    assert spans[0].total_tokens == 8
+
+
+async def _take_one(generator: Any) -> Any:
+    async for response in generator:
+        yield response
+        return
+
+
+def test_replay_llm_preserves_wrapped_identity() -> None:
+    """The wrapper must retain the exact BaseLlm instance it delegates to."""
+    from google.adk.models import BaseLlm
+
+    from agent_timetravel.adapters.adk import replay_llm
+
+    class _IdentityLlm(BaseLlm):
+        model: str = "identity-test"
+
+        async def generate_content_async(
+            self, request: Any, stream: bool = False
+        ) -> Any:
+            yield SimpleNamespace(content=SimpleNamespace(parts=[]))
+
+    wrapped = _IdentityLlm()
+    wrapper = replay_llm(wrapped)
+
+    assert wrapper._timetravel_wrapped is wrapped
+
+
 async def _collect(generator: Any) -> list[Any]:
     """Drive an ADK async generator while the replay ContextVar is active."""
     return [response async for response in generator]

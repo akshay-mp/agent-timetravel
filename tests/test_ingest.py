@@ -21,6 +21,7 @@ from agent_timetravel.ingest import (
     attrs_to_dict,
     decode_export_request,
     decode_export_request_json,
+    parse_openinference_messages,
     spans_from_request,
 )
 from agent_timetravel.models import hash_payload
@@ -246,6 +247,64 @@ class TestFidelity:
         source_payload = attrs_to_dict(list(llm_proto.attributes))["llm.input_messages"]
 
         assert llm.messages_hash == hash_payload(source_payload)
+
+    def test_flat_adk_messages_hash_compacts_text_and_tool_calls(self) -> None:
+        req = _build_three_span_request()
+        llm_proto = next(
+            s
+            for s in req.resource_spans[0].scope_spans[0].spans
+            if s.span_id == _LLM_SPAN_ID
+        )
+        llm_proto.ClearField("attributes")
+        flat = {
+            "openinference.span.kind": "LLM",
+            "llm.input_messages.4.message.role": "tool",
+            "llm.input_messages.4.message.content": "{\"temp\": 72}",
+            "llm.input_messages.4.message.tool_call_id": "call_1",
+            "llm.input_messages.4.message.name": "weather",
+            "llm.input_messages.2.message.role": "assistant",
+            "llm.input_messages.2.message.contents.1.message_content.type": "tool_use",
+            "llm.input_messages.2.message.contents.1.tool_call.id": "call_1",
+            "llm.input_messages.2.message.contents.1.tool_call.function.name": "weather",
+            "llm.input_messages.2.message.contents.1.tool_call.function.arguments":
+                '{"city":"Boston"}',
+            "llm.input_messages.2.message.tool_calls.0.tool_call.id": "call_1",
+            "llm.input_messages.2.message.tool_calls.0.tool_call.function.name": "weather",
+            "llm.input_messages.2.message.tool_calls.0.tool_call.function.arguments":
+                '{"city":"Boston"}',
+            "llm.input_messages.2.message.contents.0.message_content.type": "text",
+            "llm.input_messages.2.message.contents.0.message_content.text": "Checking",
+            "llm.input_messages.0.message.role": "user",
+            "llm.input_messages.0.message.contents.0.message_content.type": "text",
+            "llm.input_messages.0.message.contents.0.message_content.text": "Weather?",
+        }
+        llm_proto.attributes.extend(_kv(key, string_value=value) for key, value in flat.items())
+
+        expected = [
+            {"role": "user", "content": "Weather?"},
+            {
+                "role": "assistant",
+                "content": "Checking",
+                "tool_calls": [
+                    {
+                        "name": "weather",
+                        "args": {"city": "Boston"},
+                        "id": "call_1",
+                        "type": "tool_call",
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": '{"temp":72}',
+                "tool_call_id": "call_1",
+                "name": "weather",
+            },
+        ]
+        attrs = attrs_to_dict(llm_proto.attributes)
+        assert parse_openinference_messages(attrs) == expected
+        span = next(s for s in spans_from_request(req) if s.span_id == _LLM_SPAN_ID.hex())
+        assert span.messages_hash == hash_payload(expected)
 
 
 # --- anyvalue_to_python ----------------------------------------------------

@@ -391,6 +391,10 @@ class ReplaySession:
         a distinct timeline via ``trace_id`` + ``branch_id`` filtering.
         """
         self.store.insert_span(span, branch_id=self.branch_id)
+        for index, cached in enumerate(self._spans_cache):
+            if cached.timetravel_id == span.timetravel_id:
+                self._spans_cache[index] = span
+                return
         self._spans_cache.append(span)
         self._cursor = len(self._spans_cache)
 

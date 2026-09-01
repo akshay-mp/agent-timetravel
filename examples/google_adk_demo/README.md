@@ -21,6 +21,7 @@ No manual model wrapping: the workbench auto-activates the ADK interceptor
 ## Prerequisites
 
 - `pip install agent-timetravel[adk]` (ADK + TimeTravel) in the environment.
+- This example targets the pinned Google ADK 1.x range, `google-adk>=1.28.1,<2`.
 - Unsloth Studio (or llama.cpp) serving Gemma, e.g. the model id
   `unsloth/gemma-4-12b-it-GGUF` on `http://127.0.0.1:8888/v1`.
 
@@ -46,8 +47,11 @@ the tool, or branch the run.
 
 ## Configuration
 
+Set these environment variables in the shell. This example does not load
+`.env` files.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `ADK_GEMMA_BASE_URL` | `http://127.0.0.1:8888/v1` | OpenAI-compatible endpoint |
 | `ADK_GEMMA_MODEL` | `unsloth/gemma-4-12b-it-GGUF` | model id as reported by the server |
-| `OPENAI_API_KEY` | `local` | Unsloth Studio requires the key from your `.env` |
+| `OPENAI_API_KEY` | `local` | API key passed to the local server |

@@ -27,7 +27,7 @@ Run under the workbench::
         --db /tmp/adk-gemma-demo.db --no-open
     # → http://127.0.0.1:8484/ui  (start the "ask" agent from the browser)
 
-Configuration (environment or repo .env): ``OPENAI_API_KEY``,
+Configuration (environment variables): ``OPENAI_API_KEY``,
 ``ADK_GEMMA_BASE_URL`` (default http://127.0.0.1:8888/v1), ``ADK_GEMMA_MODEL``
 (default unsloth/gemma-4-12b-it-GGUF).
 """
@@ -146,6 +146,31 @@ def _contents_to_messages(llm_request: Any, system: str | None) -> list[dict[str
     return messages
 
 
+def _normalize_schema_types(value: Any) -> Any:
+    """Convert ADK schema type enums to lowercase OpenAI JSON Schema strings."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                _normalize_schema_type(item)
+                if key == "type"
+                else _normalize_schema_types(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalize_schema_types(item) for item in value]
+    return value
+
+
+def _normalize_schema_type(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_normalize_schema_type(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_schema_type(item) for item in value)
+    raw_value = getattr(value, "value", value)
+    return raw_value.lower() if isinstance(raw_value, str) else value
+
+
 def _declarations_to_tools(llm_request: Any) -> list[dict[str, Any]] | None:
     """Convert ADK ``config.tools`` function declarations to OpenAI ``tools``."""
     config = getattr(llm_request, "config", None)
@@ -160,6 +185,7 @@ def _declarations_to_tools(llm_request: Any) -> list[dict[str, Any]] | None:
                     if parameters is not None
                     else {"type": "object", "properties": {}}
                 )
+            schema = _normalize_schema_types(schema)
             tools.append(
                 {
                     "type": "function",

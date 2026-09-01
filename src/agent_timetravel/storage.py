@@ -597,7 +597,12 @@ class TraceStore:
                     end_time = excluded.end_time,
                     status = excluded.status,
                     status_message = excluded.status_message,
+                    model_name = excluded.model_name,
+                    prompt_tokens = excluded.prompt_tokens,
+                    completion_tokens = excluded.completion_tokens,
                     total_tokens = excluded.total_tokens,
+                    messages_hash = excluded.messages_hash,
+                    tools_hash = excluded.tools_hash,
                     raw_attributes = excluded.raw_attributes
                 """,
                 (

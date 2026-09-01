@@ -26,8 +26,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from pydantic import PrivateAttr
+
 from agent_timetravel.adapters._common import assert_not_frozen, build_live_span
-from agent_timetravel.adk_intercept import _WRAPPER_FORWARD
+from agent_timetravel.adk_intercept import (
+    _WRAPPER_FORWARD,
+    _canonical_messages_from_adk,
+    _function_calls_of,
+    _materialise_response,
+    _response_text,
+    _usage_of,
+)
 from agent_timetravel.openai_intercept import extract_signature
 
 if TYPE_CHECKING:
@@ -77,7 +86,7 @@ def replay_llm(
     class _ReplayLlm(BaseLlm):  # type: ignore[misc]
         """Subclass created at factory-call time so imports resolve lazily."""
 
-        _timetravel_wrapped: BaseLlm = wrapped
+        _timetravel_wrapped: BaseLlm = PrivateAttr(default_factory=lambda: wrapped)
         _timetravel_trace_id: str | None = trace_id
 
         # ------------------------------------------------------------------
@@ -102,14 +111,17 @@ def replay_llm(
                 return
 
             assert_not_frozen(session)
-            final: Any = None
+            captured_span: Any = None
             async for response in self._forward_content(llm_request, stream):
-                final = response
-                yield response
-            if final is not None:
-                self._capture_live_span(
-                    llm_request, session, signature, final, self._get_model_name()
+                captured_span = self._capture_live_span(
+                    llm_request,
+                    session,
+                    signature,
+                    response,
+                    self._get_model_name(),
+                    span=captured_span,
                 )
+                yield response
 
         @property
         def _llm_type(self) -> str:
@@ -213,7 +225,7 @@ def replay_llm(
             # ``.config.tools``. We re-use the shared extraction from
             # openai_intercept because TimeTravel treats any (model, messages,
             # tools) triple as a playback key.
-            messages = _messages_from_adk(request)
+            messages = _canonical_messages_from_adk(request)
             return extract_signature(
                 model=self._get_model_name(),
                 messages=messages,
@@ -221,20 +233,7 @@ def replay_llm(
             )
 
         def _materialise(self, recorded: Any) -> LlmResponse:
-            payload = recorded.payload or {}
-            response = (
-                payload.get("gen_ai.response")
-                or payload.get("raw_response")
-                or payload.get("response")
-                or {}
-            )
-            choices = response.get("choices") or [{}]
-            first = choices[0] if isinstance(choices, list) and choices else {}
-            content = (
-                (first.get("message") or {}).get("content") if isinstance(first, dict) else ""
-            ) or ""
-            # ADK's LlmResponse has a content field that wraps text in a Part.
-            return _llm_response_from_text(content, model=self._get_model_name())
+            return _materialise_response(recorded, self._get_model_name())
 
         def _capture_live_span(
             self,
@@ -243,19 +242,45 @@ def replay_llm(
             signature: Any,
             result: Any,
             model_name: str,
-        ) -> None:
-            content = _llm_response_to_text(result)
+            span: Any = None,
+        ) -> Any:
+            content = _response_text(result)
+            calls = _function_calls_of(result)
+            usage = _usage_of(result)
+            message: dict[str, Any] = {"role": "assistant", "content": content}
+            if calls:
+                message["tool_calls"] = calls
+            raw_extras: dict[str, Any] = {
+                "gen_ai.response": {"choices": [{"message": message}]}
+            }
+            if usage:
+                raw_extras["gen_ai.response"]["usage"] = {
+                    "prompt_tokens": usage.get("prompt", 0),
+                    "completion_tokens": usage.get("completion", 0),
+                    "total_tokens": usage.get("total", 0),
+                }
+            previous_span = span
             span = build_live_span(
                 session,
                 model_name=model_name,
-                messages=_messages_from_adk(request),
+                messages=_canonical_messages_from_adk(request),
                 content=content,
+                raw_extras=raw_extras,
                 # The interceptor hashes config.tools into its signature; a
                 # span without the same tools_hash would never match a
                 # tool-carrying call replayed through the workbench.
                 tools_hash=getattr(signature, "tools_hash", None),
             )
+            if previous_span is not None:
+                span.timetravel_id = previous_span.timetravel_id
+            if "prompt" in usage:
+                span.prompt_tokens = usage["prompt"]
+            if "completion" in usage:
+                span.completion_tokens = usage["completion"]
+            if "total" in usage:
+                span.total_tokens = usage["total"]
             session.record_new(span)
+            return span
 
         def _active_session(self) -> ReplaySession | None:
             # pylint: disable=import-outside-toplevel
@@ -284,28 +309,8 @@ def replay_llm(
 # ADK content-shape helpers
 # ----------------------------------------------------------------------
 def _messages_from_adk(request: Any) -> list[dict[str, Any]]:
-    """Extract a JSONable ``[{role, content}, ...]`` list from an ADK request.
-
-    ADK's ``LlmRequest.contents`` is a list of ``Content`` objects
-    (proto-like with roles) or dicts depending on the version; the
-    extract-signature helper coerces through ``_to_jsonable`` so a tolerant
-    ``[c if dict else getattr(c, "role", "user"), …]`` copy is enough.
-    """
-    contents = getattr(request, "contents", None) or []
-    out: list[dict[str, Any]] = []
-    for content in contents:
-        if hasattr(content, "model_dump"):
-            out.append(content.model_dump())
-        elif isinstance(content, dict):
-            out.append(content)
-        else:
-            # Best-effort duck-typed copy: proto + pydantic both expose
-            # ``role`` + a text equivalent of ``parts``.
-            role = getattr(content, "role", "user")
-            parts = getattr(content, "parts", []) or []
-            text = _flatten_parts(parts)
-            out.append({"role": role, "content": text})
-    return out
+    """Return the shared canonical message shape used by ADK replay paths."""
+    return _canonical_messages_from_adk(request)
 
 
 def _flatten_parts(parts: Any) -> str:

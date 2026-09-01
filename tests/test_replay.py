@@ -372,6 +372,34 @@ def test_record_new_appends_under_branch_id(
     assert session.cursor == len(session.recorded_spans())
 
 
+def test_record_new_replaces_cached_span_for_repeated_timetravel_id(
+    store: TraceStore,
+    trace_id: str,
+) -> None:
+    """Repeated updates refresh one cached span without moving the cursor."""
+    store.upsert_trace(Trace(trace_id=trace_id))
+    session = ReplaySession.for_root(store, trace_id, mode=ReplayMode.BRANCH)
+    live_span = _llm_span(
+        trace_id,
+        span_id="c" * 16,
+        messages=[{"role": "user", "content": "live"}],
+        response_content="first",
+    )
+
+    session.record_new(live_span)
+    first_cursor = session.cursor
+    live_span.raw_attributes["gen_ai.response"]["choices"][0]["message"][
+        "content"
+    ] = "second"
+    session.record_new(live_span)
+
+    assert len(session.recorded_spans()) == 1
+    assert session.recorded_spans()[0].raw_attributes["gen_ai.response"]["choices"][0][
+        "message"
+    ]["content"] == "second"
+    assert session.cursor == first_cursor
+
+
 # ----------------------------------------------------------------------
 # replay() context manager
 # ----------------------------------------------------------------------
