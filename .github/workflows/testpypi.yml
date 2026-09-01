@@ -43,7 +43,7 @@ jobs:
         with:
           name: testpypi-frontend-dist
           path: web/dist
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Require explicit TestPyPI confirmation
