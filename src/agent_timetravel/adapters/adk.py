@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from agent_timetravel.adapters._common import assert_not_frozen, build_live_span
+from agent_timetravel.adk_intercept import _WRAPPER_FORWARD
 from agent_timetravel.openai_intercept import extract_signature
 
 if TYPE_CHECKING:
@@ -90,9 +91,7 @@ def replay_llm(
             """Replay or forward ADK's async-generator model contract."""
             session = self._active_session()
             if session is None:
-                async for response in self._timetravel_wrapped.generate_content_async(
-                    llm_request, stream=stream
-                ):
+                async for response in self._forward_content(llm_request, stream):
                     yield response
                 return
 
@@ -104,14 +103,12 @@ def replay_llm(
 
             assert_not_frozen(session)
             final: Any = None
-            async for response in self._timetravel_wrapped.generate_content_async(
-                llm_request, stream=stream
-            ):
+            async for response in self._forward_content(llm_request, stream):
                 final = response
                 yield response
             if final is not None:
                 self._capture_live_span(
-                    llm_request, session, final, self._get_model_name()
+                    llm_request, session, signature, final, self._get_model_name()
                 )
 
         @property
@@ -142,14 +139,13 @@ def replay_llm(
             session: ReplaySession | None,
         ) -> Any:
             if session is None:
-                return await self._timetravel_wrapped.generate_response_async(request)
+                return await self._forward_response_async(request)
             signature = self._signature(request)
             recorded = session.respond_or_forward(signature)
             if recorded is None:
                 assert_not_frozen(session)
-                result = await self._timetravel_wrapped.generate_response_async(request)
-                self._capture_live_span(request, session, result,
-                                        self._get_model_name())
+                result = await self._forward_response_async(request)
+                self._capture_live_span(request, session, signature, result, self._get_model_name())
                 return result
             return self._materialise(recorded)
 
@@ -164,16 +160,49 @@ def replay_llm(
                 )
             session = self._active_session()
             if session is None:
-                return self._timetravel_wrapped.generate_response(request)
+                return self._forward_response(request)
             signature = self._signature(request)
             recorded = session.respond_or_forward(signature)
             if recorded is None:
                 assert_not_frozen(session)
-                result = self._timetravel_wrapped.generate_response(request)
-                self._capture_live_span(request, session, result,
-                                        self._get_model_name())
+                result = self._forward_response(request)
+                self._capture_live_span(request, session, signature, result, self._get_model_name())
                 return result
             return self._materialise(recorded)
+
+        # ------------------------------------------------------------------
+        # Forward helpers
+        # ------------------------------------------------------------------
+        async def _forward_content(self, llm_request: Any, stream: bool = False) -> Any:
+            """Iterate the wrapped model with the interceptor stood down.
+
+            The class-level interceptor (``agent_timetravel.adk_intercept``)
+            also wraps the inner model; the ``_WRAPPER_FORWARD`` flag tells it
+            this call is the wrapper's own forward, not a fresh interception
+            point — otherwise one divergent call would be captured twice.
+            """
+            token = _WRAPPER_FORWARD.set(True)
+            try:
+                async for response in self._timetravel_wrapped.generate_content_async(
+                    llm_request, stream=stream
+                ):
+                    yield response
+            finally:
+                _WRAPPER_FORWARD.reset(token)
+
+        def _forward_response(self, request: Any) -> Any:
+            token = _WRAPPER_FORWARD.set(True)
+            try:
+                return self._timetravel_wrapped.generate_response(request)
+            finally:
+                _WRAPPER_FORWARD.reset(token)
+
+        async def _forward_response_async(self, request: Any) -> Any:
+            token = _WRAPPER_FORWARD.set(True)
+            try:
+                return await self._timetravel_wrapped.generate_response_async(request)
+            finally:
+                _WRAPPER_FORWARD.reset(token)
 
         # ------------------------------------------------------------------
         # Helpers
@@ -188,8 +217,7 @@ def replay_llm(
             return extract_signature(
                 model=self._get_model_name(),
                 messages=messages,
-                tools=getattr(getattr(request, "config", None), "tools", None)
-                or None,
+                tools=getattr(getattr(request, "config", None), "tools", None) or None,
             )
 
         def _materialise(self, recorded: Any) -> LlmResponse:
@@ -203,9 +231,7 @@ def replay_llm(
             choices = response.get("choices") or [{}]
             first = choices[0] if isinstance(choices, list) and choices else {}
             content = (
-                (first.get("message") or {}).get("content")
-                if isinstance(first, dict)
-                else ""
+                (first.get("message") or {}).get("content") if isinstance(first, dict) else ""
             ) or ""
             # ADK's LlmResponse has a content field that wraps text in a Part.
             return _llm_response_from_text(content, model=self._get_model_name())
@@ -214,6 +240,7 @@ def replay_llm(
             self,
             request: Any,
             session: ReplaySession,
+            signature: Any,
             result: Any,
             model_name: str,
         ) -> None:
@@ -223,6 +250,10 @@ def replay_llm(
                 model_name=model_name,
                 messages=_messages_from_adk(request),
                 content=content,
+                # The interceptor hashes config.tools into its signature; a
+                # span without the same tools_hash would never match a
+                # tool-carrying call replayed through the workbench.
+                tools_hash=getattr(signature, "tools_hash", None),
             )
             session.record_new(span)
 
@@ -357,6 +388,7 @@ def _adk_types() -> tuple[Any, Any, Any]:
         from google.adk.models import BaseLlm, LlmRequest, LlmResponse
     except ImportError:
         from google.adk.models.llms import BaseLlm, LlmResponse
+
         try:
             from google.adk.models.llms import LlmRequest
         except ImportError:  # pragma: no cover - legacy ADK shape

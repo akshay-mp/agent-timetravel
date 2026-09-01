@@ -66,11 +66,12 @@ that SDK is configured for an OpenAI-compatible endpoint. LangGraph /
 langchain apps get the same auto-activation: every `BaseChatModel` and
 `BaseTool` `invoke`/`ainvoke` inside the run is stepped, replayed, and
 captured — `agent-timetravel app:main` accepts a bare compiled graph as the launch
-target. Other framework replay adapters remain explicit. Generic decorator
-auto-activation for CrewAI, PydanticAI, ADK, and SmolAgents is currently
-unavailable; the
-capability response reports the actionable adapter/wrapper instead of
-assuming an optional framework package is installed. See
+target. Google ADK agents get the same generic activation: every
+`BaseLlm.generate_content_async` and ADK `BaseTool.run_async` is stepped and
+captured (see `examples/google_adk_demo/` for a live Gemma-on-Unsloth demo).
+Other framework replay adapters (CrewAI, PydanticAI, SmolAgents) remain
+explicit; the capability response reports the actionable adapter/wrapper
+instead of assuming an optional framework package is installed. See
 [`replay-adapters.md`](replay-adapters.md) and [`wiring.md`](wiring.md).
 
 ## Acceptance Walkthrough

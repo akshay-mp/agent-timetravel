@@ -71,6 +71,12 @@ with replay(trace_id="…", branch_at=2, mode="branch"):
 
 ### ADK  *(Phase 6)*
 
+> **Workbench runs no longer need this wrapper.** `agent-timetravel dev` /
+> `agent-timetravel app:main` auto-activates ADK interception (every
+> `BaseLlm.generate_content_async` and ADK `BaseTool.run_async` is stepped
+> and captured). The factory below remains for replay contexts you drive
+> yourself from Python.
+
 Install the supported Google ADK 1.x range alongside TimeTravel's adapter extra:
 
 ```bash
@@ -86,6 +92,12 @@ replay_wrapped = replay_llm(real_llm, trace_id="…")
 # Pass replay_wrapped to your ADK agent's `model=…` slot.
 # ADK invokes replay_wrapped.generate_content_async(request, stream=False).
 ```
+
+Decorate the workbench entry point with `@timetravel.agent(framework="adk")`
+(or rely on `framework="auto"` detection) and the interceptor patches every
+concrete `BaseLlm` subclass for the run — models constructed inside
+callbacks are covered too, and ADK tools get the same mock / skip / reject
+/ edit semantics as langchain tools.
 
 ### CrewAI  *(Phase 6)*
 

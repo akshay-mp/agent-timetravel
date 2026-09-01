@@ -105,13 +105,7 @@ _PLUGINS: dict[str, FrameworkPlugin] = {
     "adk": FrameworkPlugin(
         "adk",
         ("google.adk",),
-        {"interactive_llm": False, "native_tool_calls": False, "python_tools": True},
-        "agent_timetravel.adapters.adk.replay_llm",
-        workbench_supported=False,
-        unsupported_reason=(
-            "generic ADK activation is not wired; wrap the target LLM with "
-            "agent_timetravel.adapters.adk.replay_llm"
-        ),
+        {"interactive_llm": True, "native_tool_calls": True, "python_tools": True},
     ),
     "smolagents": FrameworkPlugin(
         "smolagents",
@@ -314,6 +308,10 @@ class AgentDefinition:
             patch_context = patch()
         elif self.framework == "langgraph":
             from agent_timetravel.langgraph_intercept import patch
+
+            patch_context = patch()
+        elif self.framework == "adk":
+            from agent_timetravel.adk_intercept import patch
 
             patch_context = patch()
         with patch_context:

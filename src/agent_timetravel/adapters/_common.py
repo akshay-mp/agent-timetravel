@@ -46,6 +46,7 @@ def build_live_span(
     raw_extras: dict[str, Any] | None = None,
     tool_name: str | None = None,
     kind_str: str = "LLM",
+    tools_hash: str | None = None,
 ) -> Any:
     """Construct a ``Span`` for a live call made during a replay.
 
@@ -72,6 +73,11 @@ def build_live_span(
         For tool spans — sets ``name`` to ``tool.{tool_name}``.
     kind_str:
         ``SpanKind`` enum value name (``LLM`` / ``TOOL`` / ``AGENT``).
+    tools_hash:
+        Hash of the outbound tool declarations, when the framework signature
+        carries tools. Adapters that sign their calls with a tools hash must
+        store it here — the replay matcher requires span and signature to
+        agree on ``tools_hash`` for tool-carrying calls.
     """
     # pylint: disable=import-outside-toplevel
     from agent_timetravel.enums import SpanKind, SpanStatus
@@ -106,6 +112,7 @@ def build_live_span(
         status=SpanStatus.OK,
         model_name=model_name if kind is SpanKind.LLM else None,
         messages_hash=hash_payload(payload_messages),
+        tools_hash=tools_hash,
         raw_attributes=raw,
     )
 

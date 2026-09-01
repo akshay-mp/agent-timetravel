@@ -100,8 +100,13 @@ frameworks below — no manual model wrapping required:
   replayed, and captured unchanged. This includes graphs built with
   deepagents, LangGraph's prebuilt `create_react_agent`, and similar
   frameworks on top of `langchain-core`.
+* **Google ADK** — every `BaseLlm.generate_content_async` (Gemini,
+  Gemma, LiteLlm, Anthropic, and user-defined subclasses alike) and every ADK
+  `BaseTool.run_async`, so agents built on `google-adk` are stepped,
+  replayed, and captured without wrapping their models, including models
+  constructed inside callbacks.
 
-Other framework replay adapters (CrewAI, PydanticAI, ADK, SmolAgents)
+Other framework replay adapters (CrewAI, PydanticAI, SmolAgents)
 remain explicit: use the factories in
 [`docs/replay-adapters.md`](docs/replay-adapters.md) when needed. Generic
 decorator auto-activation for those frameworks is currently unavailable, and
@@ -158,7 +163,8 @@ with replay(store, trace_id="<trace>", branch_at=4, mode="branch"):
 One import + one wrapper call per agent — no upstream framework changes:
 
 ```python
-# Google ADK
+# Google ADK (manual factory — workbench runs on framework="adk" intercept
+# automatically, so this is only needed for replay contexts you drive yourself)
 from agent_timetravel.adapters.adk import replay_llm
 agent = Agent(model=replay_llm(real_adk_llm))
 

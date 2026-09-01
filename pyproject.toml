@@ -169,6 +169,9 @@ ignore = ["S101"]  # allow assert in tests
 # Same SDK-boundary monkey-patch for langchain: signatures mirror
 # BaseChatModel/BaseTool's `input`/`config` parameters verbatim.
 "src/agent_timetravel/langgraph_intercept.py" = ["ANN401", "A002"]
+# Same SDK-boundary monkey-patch for Google ADK: signatures mirror
+# BaseLlm.generate_content_async / BaseTool.run_async verbatim.
+"src/agent_timetravel/adk_intercept.py" = ["ANN401"]
 # Wraps foreign langgraph/langchain runnables — genuinely Any at the boundary.
 "src/agent_timetravel/graph_app.py" = ["ANN401"]
 # Deep-research integration scripts. The ODR graph + LangChain model objects
