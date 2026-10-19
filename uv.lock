@@ -3,9 +3,9 @@ revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.15'",
-    "python_full_version == '3.13.*'",
     "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version == '3.14.*' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*'",
     "python_full_version == '3.12.*' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and sys_platform != 'win32'",
     "python_full_version < '3.12'",
@@ -2009,12 +2009,12 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 dependencies = [
-    { name = "google-api-core", marker = "python_full_version < '3.13'" },
-    { name = "google-auth", marker = "python_full_version < '3.13'" },
-    { name = "google-cloud-core", marker = "python_full_version < '3.13'" },
-    { name = "google-crc32c", marker = "python_full_version < '3.13'" },
-    { name = "google-resumable-media", marker = "python_full_version < '3.13'" },
-    { name = "requests", marker = "python_full_version < '3.13'" },
+    { name = "google-api-core" },
+    { name = "google-auth" },
+    { name = "google-cloud-core" },
+    { name = "google-crc32c" },
+    { name = "google-resumable-media" },
+    { name = "requests" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/36/76/4d965702e96bb67976e755bed9828fa50306dca003dbee08b67f41dd265e/google_cloud_storage-2.19.0.tar.gz", hash = "sha256:cd05e9e7191ba6cb68934d8eb76054d9be4562aa89dbc4236feee4d7d51342b2", size = 5535488, upload-time = "2024-12-05T01:35:06.49Z" }
 wheels = [
@@ -2027,17 +2027,17 @@ version = "3.13.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.15'",
-    "python_full_version == '3.13.*'",
     "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version == '3.14.*' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*'",
 ]
 dependencies = [
-    { name = "google-api-core", marker = "python_full_version >= '3.13'" },
-    { name = "google-auth", marker = "python_full_version >= '3.13'" },
-    { name = "google-cloud-core", marker = "python_full_version >= '3.13'" },
-    { name = "google-crc32c", marker = "python_full_version >= '3.13'" },
-    { name = "google-resumable-media", marker = "python_full_version >= '3.13'" },
-    { name = "requests", marker = "python_full_version >= '3.13'" },
+    { name = "google-api-core" },
+    { name = "google-auth" },
+    { name = "google-cloud-core" },
+    { name = "google-crc32c" },
+    { name = "google-resumable-media" },
+    { name = "requests" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ce/7e/73bb7512df1d1aad6ce3f9aed847cd40e0cd400ba4a85d86ab8eb412e9cc/google_cloud_storage-3.13.1.tar.gz", hash = "sha256:a80bf8cac2794808aa61c50c5f769ecbbe2d10331bacd0d69d30e59b14b346b2", size = 17341051, upload-time = "2026-08-06T06:24:42.229Z" }
 wheels = [
@@ -4434,9 +4434,9 @@ version = "2.5.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.15'",
-    "python_full_version == '3.13.*'",
     "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version == '3.14.*' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*'",
     "python_full_version == '3.12.*' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and sys_platform != 'win32'",
 ]
@@ -4955,7 +4955,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess", marker = "python_full_version < '3.12' or python_full_version == '3.13.*' or python_full_version >= '3.15' or sys_platform != 'win32'" },
+    { name = "ptyprocess" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [
@@ -6066,9 +6066,9 @@ name = "regex"
 version = "2026.1.15"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version == '3.13.*'",
     "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version == '3.14.*' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*'",
     "python_full_version == '3.12.*' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and sys_platform != 'win32'",
     "python_full_version < '3.12'",
@@ -6322,15 +6322,15 @@ wheels = [
 
 [[package]]
 name = "rich"
-version = "14.3.4"
+version = "15.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "markdown-it-py" },
     { name = "pygments" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e9/67/cae617f1351490c25a4b8ac3b8b63a4dda609295d8222bad12242dfdc629/rich-14.3.4.tar.gz", hash = "sha256:817e02727f2b25b40ef56f5aa2217f400c8489f79ca8f46ea2b70dd5e14558a9", size = 230524, upload-time = "2026-04-11T02:57:45.419Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b3/76/6d163cfac87b632216f71879e6b2cf17163f773ff59c00b5ff4900a80fa3/rich-14.3.4-py3-none-any.whl", hash = "sha256:07e7adb4690f68864777b1450859253bed81a99a31ac321ac1817b2313558952", size = 310480, upload-time = "2026-04-11T02:57:47.484Z" },
+    { url = "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb", size = 310654, upload-time = "2026-04-12T08:24:02.83Z" },
 ]
 
 [[package]]
@@ -6535,8 +6535,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "python_full_version < '3.12' or python_full_version == '3.13.*' or python_full_version >= '3.15' or sys_platform != 'win32'" },
-    { name = "jeepney", marker = "python_full_version < '3.12' or python_full_version == '3.13.*' or python_full_version >= '3.15' or sys_platform != 'win32'" },
+    { name = "cryptography" },
+    { name = "jeepney" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
