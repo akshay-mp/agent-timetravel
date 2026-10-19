@@ -16,7 +16,7 @@ jobs:
       - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -40,7 +40,7 @@ jobs:
         with:
           name: release-frontend-dist
           path: web/dist
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Check tag matches project.version
@@ -55,10 +55,15 @@ jobs:
             echo "::error title=Release version mismatch::Tag v${TAG_VERSION} does not match project.version ${PROJECT_VERSION}."
             exit 1
           fi
-      - run: python -m pip install --upgrade pip && python -m pip install -e '.[dev,adk,langgraph]' build twine
-      - run: pytest tests --no-cov -m 'not integration' -q
-      - run: python scripts/packaging_smoke.py --artifacts dist
-      - run: python -m twine check dist/*
+      - name: Install locked Python environment
+        run: |
+          python -m pip install --disable-pip-version-check "uv==0.11.7"
+          uv sync --locked --extra dev --extra adk --extra langgraph --extra pydantic-ai
+          uv venv .packaging-venv --python 3.11
+          uv pip install --python .packaging-venv/bin/python "build==1.5.0" "twine==7.0.0"
+      - run: uv run --no-sync pytest tests --no-cov -m 'not integration' -q
+      - run: .packaging-venv/bin/python scripts/packaging_smoke.py --artifacts dist
+      - run: .packaging-venv/bin/python -m twine check dist/*
       - uses: actions/upload-artifact@v7
         with:
           name: release-python-artifacts
